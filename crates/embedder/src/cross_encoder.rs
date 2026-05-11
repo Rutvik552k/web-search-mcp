@@ -282,6 +282,53 @@ mod inner {
             Ok((label, conf))
         }
 
+        /// Classify NLI label from pre-computed logits (no model inference).
+        ///
+        /// Same label resolution as `classify_nli` but skips the forward pass.
+        /// Use after `score_pairs()` to avoid double inference.
+        pub fn classify_from_logits(&self, logits: &[f32]) -> (NliLabel, f32) {
+            if logits.len() < 3 {
+                return (NliLabel::Neutral, 0.5);
+            }
+
+            let sm = softmax(logits);
+
+            let mut contradiction_idx = 0;
+            let mut entailment_idx = 2;
+            let mut neutral_idx = 1;
+
+            for (idx, label) in &self.id2label {
+                match label.as_str() {
+                    "contradiction" => contradiction_idx = *idx,
+                    "entailment" => entailment_idx = *idx,
+                    "neutral" => neutral_idx = *idx,
+                    _ => {}
+                }
+            }
+
+            if sm.len() > contradiction_idx.max(entailment_idx).max(neutral_idx) {
+                let c_score = sm[contradiction_idx];
+                let e_score = sm[entailment_idx];
+                let n_score = sm[neutral_idx];
+
+                if c_score > e_score && c_score > n_score {
+                    (NliLabel::Contradiction, c_score)
+                } else if e_score > c_score && e_score > n_score {
+                    (NliLabel::Entailment, e_score)
+                } else {
+                    (NliLabel::Neutral, n_score)
+                }
+            } else {
+                if sm[0] > sm[1] && sm[0] > sm[2] {
+                    (NliLabel::Contradiction, sm[0])
+                } else if sm[2] > sm[0] && sm[2] > sm[1] {
+                    (NliLabel::Entailment, sm[2])
+                } else {
+                    (NliLabel::Neutral, sm[1])
+                }
+            }
+        }
+
         pub fn model_id(&self) -> &str {
             &self.model_id
         }
@@ -333,6 +380,10 @@ pub mod stub {
 
         pub fn classify_nli(&self, _premise: &str, _hypothesis: &str) -> Result<(NliLabel, f32)> {
             Ok((NliLabel::Neutral, 0.5))
+        }
+
+        pub fn classify_from_logits(&self, _logits: &[f32]) -> (NliLabel, f32) {
+            (NliLabel::Neutral, 0.5)
         }
 
         pub fn model_id(&self) -> &str { "none" }

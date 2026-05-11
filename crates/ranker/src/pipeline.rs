@@ -156,6 +156,16 @@ impl RankingPipeline {
         let stage2_limit = self.config.rerank_top_k.min(scored.len());
         scored.truncate(stage2_limit);
 
+        // Filter out results below minimum relevance score
+        if self.config.min_relevance_score > 0.0 {
+            let before = scored.len();
+            scored.retain(|(_, score)| *score >= self.config.min_relevance_score);
+            let filtered = before - scored.len();
+            if filtered > 0 {
+                tracing::debug!(filtered, threshold = self.config.min_relevance_score, "Low-relevance results removed");
+            }
+        }
+
         tracing::debug!(stage2_results = scored.len(), "Stage 2 complete");
 
         // Stage 3: Authority + freshness boost
@@ -267,12 +277,21 @@ impl RankingPipeline {
                     VerificationStatus::Unverified
                 };
 
-                let confidence = match verification {
-                    VerificationStatus::Verified => 0.95,
-                    VerificationStatus::Partial => 0.75,
+                // Confidence blends verification status with source tier
+                let base_confidence: f32 = match verification {
+                    VerificationStatus::Verified => 0.9,
+                    VerificationStatus::Partial => 0.7,
                     VerificationStatus::Unverified => 0.5,
                     VerificationStatus::Contested => 0.3,
                 };
+                // Tier boost: Tier1 gets +0.1, Tier2 +0.05, Tier3 +0, Tier4 -0.05
+                let tier_adj: f32 = match c.source_tier {
+                    SourceTier::Tier1 => 0.1,
+                    SourceTier::Tier2 => 0.05,
+                    SourceTier::Tier3 => 0.0,
+                    SourceTier::Tier4 => -0.05,
+                };
+                let confidence = (base_confidence + tier_adj).clamp(0.1, 0.99);
 
                 RankedResult {
                     content: web_search_extractor::extract_snippet(&c.body_text, query, 1500),
@@ -311,9 +330,9 @@ impl RankingPipeline {
 impl RankingPipeline {
     /// Run NLI-based contradiction detection across top documents.
     ///
-    /// Compares key sentences from different sources pairwise.
-    /// If NLI model classifies a pair as "contradiction" with high confidence,
-    /// adds it to the contradictions list.
+    /// Cleans text artifacts (citations, brackets) before NLI.
+    /// Reduced scope: top 5 docs → max 10 pairs (was top 10 → 45 pairs).
+    /// Uses single batched `score_pairs` call instead of individual `classify_nli` calls.
     fn run_nli_checks(
         &self,
         nli: &CrossEncoder,
@@ -322,32 +341,64 @@ impl RankingPipeline {
     ) -> Vec<Contradiction> {
         let mut contradictions = Vec::new();
 
-        // Extract first key sentence from each doc
-        let doc_sentences: Vec<(usize, String, String)> = scored.iter()
-            .take(10) // only check top 10 to limit cost
+        // Extract first meaningful sentence from top 5 docs
+        let doc_sentences: Vec<(String, String)> = scored.iter()
+            .take(5)
             .filter_map(|(idx, _)| {
                 let c = &candidates[*idx];
                 let first_sentence = c.body_text
                     .split(|ch: char| ch == '.' || ch == '!' || ch == '?')
-                    .find(|s| s.trim().split_whitespace().count() >= 8)
-                    .map(|s| s.trim().to_string())?;
-                Some((*idx, first_sentence, c.url.clone()))
+                    .find(|s| {
+                        let cleaned = clean_text_for_nli(s);
+                        cleaned.split_whitespace().count() >= 8
+                    })
+                    .map(|s| clean_text_for_nli(s))?;
+
+                if first_sentence.split_whitespace().count() < 6 {
+                    return None;
+                }
+                Some((first_sentence, c.url.clone()))
             })
             .collect();
 
-        // Pairwise NLI comparison (triangular)
+        if doc_sentences.len() < 2 {
+            return contradictions;
+        }
+
+        // Build all pairs
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        let mut pair_meta: Vec<(usize, usize)> = Vec::new();
+
         for i in 0..doc_sentences.len() {
             for j in (i + 1)..doc_sentences.len() {
-                let (_, ref sent_a, ref url_a) = doc_sentences[i];
-                let (_, ref sent_b, ref url_b) = doc_sentences[j];
+                pairs.push((&doc_sentences[i].0, &doc_sentences[j].0));
+                pair_meta.push((i, j));
+            }
+        }
 
-                match nli.classify_nli(sent_a, sent_b) {
-                    Ok((NliLabel::Contradiction, conf)) if conf > 0.7 => {
+        // Single batched model call
+        match nli.score_pairs(&pairs) {
+            Ok(scores) => {
+                for (k, score) in scores.iter().enumerate() {
+                    if k >= pair_meta.len() { break; }
+                    let logits = &score.logits;
+                    if logits.len() < 3 { continue; }
+
+                    // Use classify_nli on only those pairs that look potentially contradictory
+                    // Quick pre-filter: if no logit is dominant, skip
+                    let max_logit = logits.iter().take(3).cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let min_logit = logits.iter().take(3).cloned().fold(f32::INFINITY, f32::min);
+                    if max_logit - min_logit < 0.5 { continue; } // all similar → likely neutral
+
+                    let (i, j) = pair_meta[k];
+                    // Use pre-computed logits — no second inference call
+                    let (label, conf) = nli.classify_from_logits(logits);
+                    if label == NliLabel::Contradiction && conf > 0.7 {
                         contradictions.push(Contradiction {
-                            claim_a: sent_a.clone(),
-                            source_a: url_a.clone(),
-                            claim_b: sent_b.clone(),
-                            source_b: url_b.clone(),
+                            claim_a: doc_sentences[i].0.clone(),
+                            source_a: doc_sentences[i].1.clone(),
+                            claim_b: doc_sentences[j].0.clone(),
+                            source_b: doc_sentences[j].1.clone(),
                             severity: if conf > 0.9 {
                                 ContradictionSeverity::Hard
                             } else {
@@ -355,13 +406,48 @@ impl RankingPipeline {
                             },
                         });
                     }
-                    _ => {}
                 }
+            }
+            Err(e) => {
+                tracing::warn!("Batched NLI scoring failed: {e}");
             }
         }
 
         contradictions
     }
+}
+
+/// Clean text for NLI: strip citation brackets, HTML artifacts, excess whitespace.
+fn clean_text_for_nli(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_bracket = false;
+
+    for ch in text.chars() {
+        match ch {
+            '[' => in_bracket = true,
+            ']' => { in_bracket = false; continue; }
+            _ if in_bracket => continue,
+            _ => result.push(ch),
+        }
+    }
+
+    // Remove leftover artifacts
+    result = result
+        .replace("  ", " ")
+        .replace(" ,", ",")
+        .replace(" .", ".");
+
+    result.trim().to_string()
+}
+
+/// Quick softmax for 3 values.
+fn softmax_3(a: f32, b: f32, c: f32) -> [f32; 3] {
+    let max = a.max(b).max(c);
+    let ea = (a - max).exp();
+    let eb = (b - max).exp();
+    let ec = (c - max).exp();
+    let sum = ea + eb + ec;
+    [ea / sum, eb / sum, ec / sum]
 }
 
 /// Extract key phrases from body text for cross-reference checking.
@@ -412,6 +498,7 @@ mod tests {
             max_results_per_domain: 2,
             min_unique_orgs: 3,
             source_tiers_path: "config/source_tiers.toml".into(),
+            min_relevance_score: 0.0,
         };
 
         let pipeline = RankingPipeline::new(config);
@@ -440,6 +527,7 @@ mod tests {
             max_results_per_domain: 5,
             min_unique_orgs: 2,
             source_tiers_path: "config/source_tiers.toml".into(),
+            min_relevance_score: 0.0,
         };
 
         let pipeline = RankingPipeline::new(config);
@@ -469,6 +557,7 @@ mod tests {
             max_results_per_domain: 5,
             min_unique_orgs: 2,
             source_tiers_path: "".into(),
+            min_relevance_score: 0.0,
         };
 
         let pipeline = RankingPipeline::new(config);
@@ -511,6 +600,7 @@ mod tests {
             max_results_per_domain: 2,
             min_unique_orgs: 3,
             source_tiers_path: "".into(),
+            min_relevance_score: 0.0,
         };
 
         let pipeline = RankingPipeline::new(config);

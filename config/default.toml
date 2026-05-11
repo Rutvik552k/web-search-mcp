@@ -41,6 +41,7 @@ mmr_lambda = 0.7
 max_results_per_domain = 2
 min_unique_orgs = 3
 source_tiers_path = "config/source_tiers.toml"
+min_relevance_score = 0.35
 
 [server]
 name = "web-search-mcp"

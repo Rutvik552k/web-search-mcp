@@ -5102,6 +5102,7 @@ dependencies = [
  "url",
  "web-search-common",
  "web-search-embedder",
+ "web-search-extractor",
  "web-search-indexer",
 ]
 

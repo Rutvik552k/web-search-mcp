@@ -62,23 +62,27 @@ fn is_tier2_domain(d: &str) -> bool {
     let tier2 = [
         "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
         "nytimes.com", "washingtonpost.com", "theguardian.com",
+        "npr.org", "cnn.com", "cnbc.com", "forbes.com",
+        "news.google.com", "news.yahoo.com",
         "docs.python.org", "docs.rs", "doc.rust-lang.org",
         "developer.mozilla.org", "developer.apple.com",
         "learn.microsoft.com", "cloud.google.com",
-        "en.wikipedia.org", "stackoverflow.com",
+        "en.wikipedia.org", "wikipedia.org",
+        "stackoverflow.com",
         "github.com", "docs.github.com",
         "cppreference.com", "man7.org",
+        "wikidata.org", "wikimedia.org",
     ];
     tier2.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))
 }
 
 fn is_tier3_domain(d: &str) -> bool {
     let tier3 = [
-        "medium.com", "dev.to", "reddit.com",
+        "medium.com", "dev.to", "reddit.com", "old.reddit.com",
         "quora.com", "news.ycombinator.com",
         "hashnode.dev", "substack.com",
         "wordpress.com", "blogspot.com",
-        "tumblr.com",
+        "tumblr.com", "stackexchange.com",
     ];
     tier3.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))
 }

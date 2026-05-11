@@ -12,3 +12,4 @@ pub use crawler::Crawler;
 pub use fetcher::{FetchResult, Fetcher};
 pub use frontier::UrlFrontier;
 pub use search_results::parse_search_results;
+pub use search_results::try_parse_json_api;

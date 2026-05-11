@@ -419,7 +419,13 @@ impl SearchEngine {
         // Skip non-HTML content types (PDF, images, etc.)
         let ct = crawled.content_type.to_lowercase();
         if !ct.contains("html") && !ct.contains("text/plain") && !ct.contains("xml") {
-            tracing::debug!(url = %crawled.final_url, content_type = %ct, "Skipping non-HTML content");
+            // JSON API responses are handled by the crawler for link following,
+            // but not indexable as content pages
+            if ct.contains("json") {
+                tracing::debug!(url = %crawled.final_url, "Skipping JSON content (not indexable)");
+            } else {
+                tracing::debug!(url = %crawled.final_url, content_type = %ct, "Skipping non-HTML content");
+            }
             return None;
         }
 
@@ -438,6 +444,12 @@ impl SearchEngine {
 
         if extraction.body_text.len() < 50 {
             tracing::debug!(url = %crawled.final_url, "Skipping: too little content");
+            return None;
+        }
+
+        // Content quality filter: reject error pages, empty search results, and boilerplate
+        if is_low_quality_content(&extraction.body_text, &crawled.final_url) {
+            tracing::debug!(url = %crawled.final_url, "Skipping: low quality / error page");
             return None;
         }
 
@@ -509,16 +521,14 @@ fn generate_search_seeds(query: &str) -> Vec<String> {
         // Wikipedia — direct article attempt + search
         format!("https://en.wikipedia.org/wiki/{encoded_underscore}"),
         format!("https://en.wikipedia.org/w/index.php?search={encoded}&title=Special:Search"),
-        // Wikidata for structured knowledge
-        format!("https://www.wikidata.org/w/index.php?search={encoded}&ns0=1"),
         // Reddit discussions
         format!("https://old.reddit.com/search/?q={encoded}&sort=relevance&t=year"),
         // StackExchange
         format!("https://stackexchange.com/search?q={encoded}"),
         // ArXiv for academic papers
         format!("https://arxiv.org/search/?query={encoded}&searchtype=all"),
-        // Hacker News
-        format!("https://hn.algolia.com/?q={encoded}"),
+        // Hacker News — use Algolia API (returns JSON, SPA frontend is unscrapable)
+        format!("https://hn.algolia.com/api/v1/search?query={encoded}&tags=story"),
     ];
 
     // Add topic-specific sources based on query keywords
@@ -531,7 +541,7 @@ fn generate_search_seeds(query: &str) -> Vec<String> {
         seeds.push(format!("https://scholar.google.com/scholar?q={encoded}"));
         seeds.push(format!("https://pubmed.ncbi.nlm.nih.gov/?term={encoded}"));
     }
-    if q.contains("news") || q.contains("latest") || q.contains("today") || q.contains("2024") || q.contains("2025") || q.contains("2026") {
+    if q.contains("news") || q.contains("latest") || q.contains("today") {
         seeds.push(format!("https://news.google.com/search?q={encoded}"));
     }
 
@@ -550,6 +560,85 @@ fn sha256_short(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+/// Detect low-quality content: error pages, empty search results, CAPTCHAs, etc.
+fn is_low_quality_content(body: &str, url: &str) -> bool {
+    let lower = body.to_lowercase();
+    let word_count = body.split_whitespace().count();
+
+    // Too short to be useful content (after extraction)
+    if word_count < 30 {
+        return true;
+    }
+
+    // "No results" pages from search engines
+    let no_result_phrases = [
+        "no results matching",
+        "no results found",
+        "your search did not match",
+        "did not return any results",
+        "0 results",
+        "no documents match",
+        "there were no results",
+    ];
+    if no_result_phrases.iter().any(|p| lower.contains(p)) {
+        // If "no results" is prominent (first 500 chars), it's an error page
+        let head: String = lower.chars().take(500).collect();
+        if no_result_phrases.iter().any(|p| head.contains(p)) {
+            return true;
+        }
+    }
+
+    // CAPTCHA / access denied pages
+    let block_phrases = [
+        "please verify you are a human",
+        "complete the captcha",
+        "access denied",
+        "403 forbidden",
+        "enable javascript to continue",
+        "please enable cookies",
+        "checking your browser",
+        "just a moment...",
+    ];
+    if block_phrases.iter().any(|p| lower.contains(p)) && word_count < 200 {
+        return true;
+    }
+
+    // Search result listing pages that leaked through (Wikidata, generic search pages)
+    let url_lower = url.to_lowercase();
+    let is_search_page = url_lower.contains("special:search")
+        || url_lower.contains("wikidata.org/w/index.php?search")
+        || (url_lower.contains("search") && url_lower.contains("title=Special"));
+
+    if is_search_page {
+        return true;
+    }
+
+    // Google News homepage / aggregator pages (not actual articles)
+    if url_lower.contains("news.google.com") && !url_lower.contains("/articles/") && !url_lower.contains("/stories/") {
+        return true;
+    }
+
+    // General news aggregator / index page detection
+    let aggregator_phrases = [
+        "top stories", "trending now", "more headlines",
+        "latest news", "breaking news", "see more headlines",
+        "follow this topic", "chevron_right",
+    ];
+    let aggregator_hits = aggregator_phrases.iter().filter(|p| lower.contains(*p)).count();
+    if aggregator_hits >= 3 {
+        return true;
+    }
+
+    // Very high ratio of boilerplate signals (navigation text, footers, etc.)
+    let nav_phrases = ["privacy policy", "terms of use", "cookie policy", "sign in", "log in", "create account"];
+    let nav_count = nav_phrases.iter().filter(|p| lower.contains(*p)).count();
+    if nav_count >= 3 && word_count < 100 {
+        return true;
+    }
+
+    false
 }
 
 fn extract_domain(url: &str) -> String {

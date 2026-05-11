@@ -150,6 +150,21 @@ impl Crawler {
                                 return;
                             }
 
+                            // Check if JSON API response (e.g., HN Algolia)
+                            if result.content_type.to_lowercase().contains("json") {
+                                if let Some(search_results) = crate::search_results::try_parse_json_api(&result.body) {
+                                    tracing::info!(
+                                        url = %entry.url,
+                                        results = search_results.len(),
+                                        "Parsed JSON API response — following links"
+                                    );
+                                    for sr in &search_results {
+                                        frontier.push(&sr.url, entry.depth);
+                                    }
+                                    return;
+                                }
+                            }
+
                             // Extract links
                             let links = link_extractor::extract_links(&result.body, &result.final_url);
                             for link in &links {

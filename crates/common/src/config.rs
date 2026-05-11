@@ -99,6 +99,14 @@ pub struct RankerConfig {
     pub min_unique_orgs: usize,
     /// Path to source tiers config
     pub source_tiers_path: PathBuf,
+    /// Minimum relevance score for final results (0.0 - 1.0).
+    /// Results below this are filtered after Stage 2 cross-encoder reranking.
+    #[serde(default = "default_min_relevance_score")]
+    pub min_relevance_score: f32,
+}
+
+fn default_min_relevance_score() -> f32 {
+    0.35
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +166,7 @@ impl Default for Config {
                 max_results_per_domain: 2,
                 min_unique_orgs: 3,
                 source_tiers_path: PathBuf::from("config/source_tiers.toml"),
+                min_relevance_score: 0.35,
             },
             server: ServerConfig {
                 name: "web-search-mcp".to_string(),

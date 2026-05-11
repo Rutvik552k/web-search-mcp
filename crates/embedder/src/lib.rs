@@ -60,22 +60,41 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Create the best available embedder based on compiled features and config.
+///
+/// Priority: CandleEmbedder (neural, default) → HashEmbedder (fallback).
+/// CandleEmbedder auto-downloads all-MiniLM-L6-v2 from HuggingFace on first run.
+/// If download fails (e.g., no internet), falls back to HashEmbedder gracefully.
 pub fn create_embedder(config: &web_search_common::config::EmbedderConfig) -> Box<dyn Embedder> {
-    #[cfg(feature = "candle")]
-    {
-        match CandleEmbedder::new(config) {
-            Ok(e) => {
-                tracing::info!(model = e.model_name(), dim = e.dimensions(), "Using CandleEmbedder");
-                return Box::new(e);
-            }
-            Err(e) => {
-                tracing::warn!("CandleEmbedder init failed, falling back to HashEmbedder: {e}");
+    if config.force_cpu {
+        tracing::info!("force_cpu set, skipping neural embedder");
+    } else {
+        #[cfg(feature = "candle")]
+        {
+            tracing::info!("Initializing neural embedder (candle)...");
+            match CandleEmbedder::new(config) {
+                Ok(e) => {
+                    tracing::info!(
+                        model = e.model_name(),
+                        dim = e.dimensions(),
+                        "Neural embedder ready (CandleEmbedder)"
+                    );
+                    return Box::new(e);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "CandleEmbedder init failed (will use hash fallback): {e}\n\
+                         Tip: ensure internet connectivity for first-run model download"
+                    );
+                }
             }
         }
     }
 
     let e = HashEmbedder::new(config.embedding_dim);
-    tracing::info!(dim = e.dimensions(), "Using HashEmbedder (feature hashing)");
+    tracing::info!(
+        dim = e.dimensions(),
+        "Using HashEmbedder (feature hashing — no semantic matching)"
+    );
     Box::new(e)
 }
 

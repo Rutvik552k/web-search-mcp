@@ -1,29 +1,98 @@
 use web_search_common::models::Page;
 use web_search_common::models::PageMetadata;
 use chrono::Utc;
+use regex::Regex;
 
 use crate::metadata;
 use crate::readability;
 use crate::trafilatura;
 use crate::ExtractionResult;
 
+/// Strip script, style, svg, noscript, and other non-content tags from HTML
+/// BEFORE passing to extraction algorithms. Prevents CSS/JS leaks in body text.
+fn sanitize_html(html: &str) -> String {
+    // Remove entire tag blocks that contain non-content
+    let patterns = [
+        r"(?si)<script[^>]*>.*?</script>",
+        r"(?si)<style[^>]*>.*?</style>",
+        r"(?si)<svg[^>]*>.*?</svg>",
+        r"(?si)<noscript[^>]*>.*?</noscript>",
+        r"(?si)<iframe[^>]*>.*?</iframe>",
+        r"(?si)<!--.*?-->",
+    ];
+
+    let mut cleaned = html.to_string();
+    for pattern in &patterns {
+        let re = Regex::new(pattern).unwrap();
+        cleaned = re.replace_all(&cleaned, "").to_string();
+    }
+
+    // Remove inline style attributes
+    let style_attr = Regex::new(r#"\s*style="[^"]*""#).unwrap();
+    cleaned = style_attr.replace_all(&cleaned, "").to_string();
+
+    cleaned
+}
+
+/// Clean extracted body text: remove residual CSS, collapse whitespace.
+fn clean_body_text(text: &str) -> String {
+    let mut cleaned = text.to_string();
+
+    // Remove any CSS that leaked through (e.g., .mw-parser-output ul.cslist{...})
+    let css_block = Regex::new(r"(?s)[.\w][\w.-]*(?:\s+[\w.#\[\]=:,>+~ -]+)*\s*\{[^}]*\}").unwrap();
+    cleaned = css_block.replace_all(&cleaned, "").to_string();
+
+    // Remove CSS-like property declarations
+    let _css_prop = Regex::new(r"[a-z-]+\s*:\s*[^;]+;\s*").unwrap();
+    // Only remove if line looks entirely like CSS (no regular sentence structure)
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let cleaned_lines: Vec<&str> = lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Skip lines that look like pure CSS
+            if trimmed.starts_with('.') && trimmed.contains('{') {
+                return false;
+            }
+            if trimmed.starts_with("@media") || trimmed.starts_with("@import") {
+                return false;
+            }
+            true
+        })
+        .copied()
+        .collect();
+    cleaned = cleaned_lines.join("\n");
+
+    // Collapse multiple whitespace/newlines
+    let multi_newline = Regex::new(r"\n{3,}").unwrap();
+    cleaned = multi_newline.replace_all(&cleaned, "\n\n").to_string();
+
+    let multi_space = Regex::new(r"[ \t]{2,}").unwrap();
+    cleaned = multi_space.replace_all(&cleaned, " ").to_string();
+
+    cleaned.trim().to_string()
+}
+
 /// Extract content from HTML using multi-pass consensus voting.
 ///
+/// Pre-step: Sanitize HTML (strip script/style/svg/noscript)
 /// Pass 1: Trafilatura-RS (density-based, F1~0.85)
 /// Pass 2: Readability (DOM scoring, F1~0.80)
 ///
-/// Consensus: use the pass with higher confidence, merge headings.
-/// When ML classifier is added, it becomes 3-pass with 2/3 majority voting.
+/// Post-step: Clean body text (remove residual CSS, collapse whitespace)
 pub fn extract_page(html: &str, url: &str) -> ExtractionResult {
-    // Run both extraction passes
-    let traf_result = trafilatura::extract(html);
-    let read_result = readability::extract(html);
+    // Sanitize HTML before extraction
+    let clean_html = sanitize_html(html);
 
-    // Pick best body text by confidence
+    // Run both extraction passes on sanitized HTML
+    let traf_result = trafilatura::extract(&clean_html);
+    let read_result = readability::extract(&clean_html);
+
+    // Pick best body text by confidence, then clean
     let (body_text, confidence) = if traf_result.confidence >= read_result.confidence {
-        (traf_result.body_text.clone(), traf_result.confidence)
+        (clean_body_text(&traf_result.body_text), traf_result.confidence)
     } else {
-        (read_result.body_text.clone(), read_result.confidence)
+        (clean_body_text(&read_result.body_text), read_result.confidence)
     };
 
     // If both produced content, boost confidence
@@ -180,5 +249,46 @@ mod tests {
         assert_eq!(page.title.as_deref(), Some("Title"));
         assert_eq!(page.metadata.status_code, 200);
         assert_eq!(page.metadata.extraction_confidence, 0.9);
+    }
+
+    #[test]
+    fn sanitize_strips_script_and_style() {
+        let html = r#"<html><head>
+            <style>.mw-parser-output { color: red; }</style>
+            <script>var x = 1;</script>
+        </head><body>
+            <article>
+                <p>Clean content that should survive sanitization and be properly extracted by the readability algorithm.</p>
+                <p>More clean content in a second paragraph for the extraction to identify as main text.</p>
+            </article>
+        </body></html>"#;
+
+        let result = extract_page(html, "https://example.com/");
+        assert!(!result.body_text.contains("mw-parser-output"));
+        assert!(!result.body_text.contains("var x = 1"));
+        assert!(result.body_text.contains("Clean content"));
+    }
+
+    #[test]
+    fn clean_body_removes_css_leaks() {
+        let dirty = ".mw-parser-output ul.cslist{margin:0;padding:0}\nActual content here.\nMore real text.";
+        let cleaned = clean_body_text(dirty);
+        assert!(!cleaned.contains("mw-parser-output"));
+        assert!(cleaned.contains("Actual content"));
+    }
+
+    #[test]
+    fn sanitize_preserves_content_structure() {
+        let html = r#"<html><body>
+            <h1>Title</h1>
+            <p>Paragraph one with meaningful content for extraction testing purposes.</p>
+            <table><tr><th>A</th></tr><tr><td>1</td></tr></table>
+            <svg><path d="M0 0"/></svg>
+            <p>Paragraph two after the SVG that should still be extracted properly.</p>
+        </body></html>"#;
+
+        let result = extract_page(html, "https://example.com/");
+        assert!(!result.body_text.contains("svg"));
+        assert!(!result.body_text.contains("path"));
     }
 }

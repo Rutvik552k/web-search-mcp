@@ -103,6 +103,74 @@ impl HnswIndex {
     pub fn get(&self, doc_id: &str) -> Option<Vec<f32>> {
         self.vectors.get(doc_id).map(|v| v.value().clone())
     }
+
+    /// Save the vector index to a file (bincode serialization).
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let entries: Vec<(String, Vec<f32>)> = self
+            .vectors
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+
+        let serialized = serde_json::to_vec(&serde_json::json!({
+            "dim": self.dim,
+            "vectors": entries,
+        }))
+        .map_err(|e| Error::Index(format!("serialize vectors: {e}")))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&serialized)?;
+
+        tracing::info!(vectors = entries.len(), path = %path.display(), "Vector index saved");
+        Ok(())
+    }
+
+    /// Load a vector index from a file.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::Index(format!("vector index not found: {}", path.display())));
+        }
+
+        let data = std::fs::read(path)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&data)
+            .map_err(|e| Error::Index(format!("deserialize vectors: {e}")))?;
+
+        let dim = parsed["dim"].as_u64().unwrap_or(384) as usize;
+        let index = HnswIndex::new(dim);
+
+        if let Some(vectors) = parsed["vectors"].as_array() {
+            for entry in vectors {
+                if let (Some(key), Some(vec_arr)) = (entry[0].as_str(), entry[1].as_array()) {
+                    let vec: Vec<f32> = vec_arr
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect();
+                    if vec.len() == dim {
+                        index.vectors.insert(key.to_string(), vec);
+                    }
+                }
+            }
+        }
+
+        tracing::info!(vectors = index.len(), path = %path.display(), "Vector index loaded");
+        Ok(index)
+    }
+
+    /// Load from file if exists, otherwise create new empty index.
+    pub fn open_or_create(path: &std::path::Path, dim: usize) -> Self {
+        match Self::load(path) {
+            Ok(idx) => idx,
+            Err(_) => {
+                tracing::info!("Creating new vector index");
+                Self::new(dim)
+            }
+        }
+    }
 }
 
 /// Helper for min-heap (smallest score at top).

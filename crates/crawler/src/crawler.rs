@@ -49,10 +49,11 @@ impl Crawler {
         })
     }
 
-    /// Crawl starting from seed URLs. Returns crawled pages via channel.
+    /// Crawl starting from seed URLs with concurrent fetching.
     ///
-    /// Spawns `num_workers` concurrent fetchers. Stops when frontier is empty
-    /// or `max_pages` reached or `time_limit` exceeded.
+    /// Pops batches of URLs from the frontier and fetches them in parallel
+    /// (up to `concurrency` at a time). Stops when frontier is empty,
+    /// `max_pages` reached, or `time_limit` exceeded.
     pub async fn crawl(
         &self,
         seeds: &[&str],
@@ -60,98 +61,156 @@ impl Crawler {
         max_depth: u8,
         time_limit: Duration,
     ) -> Vec<CrawledPage> {
+        use tokio::sync::Semaphore;
+
         let start = Instant::now();
+        let concurrency = self.config.num_workers.max(4);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
 
         // Add seeds to frontier
         self.frontier.add_seeds(seeds);
 
-        let mut crawled: Vec<CrawledPage> = Vec::new();
+        let crawled: Arc<tokio::sync::Mutex<Vec<CrawledPage>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut consecutive_empty = 0;
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        while crawled.len() < max_pages && start.elapsed() < time_limit {
-            // Pop next URL from frontier
-            let entry = match self.frontier.pop() {
-                Some(e) => e,
-                None => {
-                    consecutive_empty += 1;
-                    if consecutive_empty > 3 {
-                        break; // frontier exhausted
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+        loop {
+            // Check limits
+            {
+                let current = crawled.lock().await.len();
+                if current >= max_pages || start.elapsed() >= time_limit {
+                    break;
                 }
-            };
+            }
+
+            // Pop a batch of URLs from frontier
+            let mut batch = Vec::new();
+            for _ in 0..concurrency {
+                match self.frontier.pop() {
+                    Some(entry) if entry.depth <= max_depth => batch.push(entry),
+                    Some(_) => {} // too deep, skip
+                    None => break,
+                }
+            }
+
+            if batch.is_empty() {
+                consecutive_empty += 1;
+                if consecutive_empty > 3 {
+                    break;
+                }
+                // Wait for in-flight fetches to potentially add new URLs
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
             consecutive_empty = 0;
 
-            // Skip if depth exceeded
-            if entry.depth > max_depth {
-                continue;
-            }
+            // Spawn concurrent fetch tasks for the batch
+            for entry in batch {
+                // Check robots.txt
+                if self.config.respect_robots_txt && !self.robots.is_allowed(&entry.url) {
+                    continue;
+                }
 
-            // Check robots.txt
-            if self.config.respect_robots_txt && !self.robots.is_allowed(&entry.url) {
-                tracing::debug!(url = %entry.url, "Blocked by robots.txt");
-                continue;
-            }
+                let sem = semaphore.clone();
+                let fetcher = self.fetcher.clone();
+                let frontier = self.frontier.clone();
+                let throttle = self.throttle.clone();
+                let crawled = crawled.clone();
+                let max_pages = max_pages;
 
-            // Throttle
-            self.throttle.wait(&entry.domain).await;
-
-            // Fetch
-            tracing::debug!(url = %entry.url, depth = entry.depth, "Fetching");
-            match self.fetcher.fetch(&entry.url).await {
-                Ok(result) => {
-                    // Fetch robots.txt for domain if not cached (first visit)
-                    self.maybe_fetch_robots(&entry.domain).await;
-
-                    // Extract links and add to frontier
-                    let links = link_extractor::extract_links(&result.body, &result.final_url);
-                    for link in &links {
-                        if !link.is_external || entry.depth == 0 {
-                            // Follow internal links and external links from seeds
-                            self.frontier.push(&link.url, entry.depth + 1);
-                        }
-                    }
-
-                    let page = CrawledPage {
-                        url: entry.url.clone(),
-                        final_url: result.final_url,
-                        body: result.body,
-                        content_type: result.content_type,
-                        status: result.status,
-                        response_time_ms: result.response_time_ms,
-                        depth: entry.depth,
-                        is_spa: result.is_spa,
-                        links,
+                handles.push(tokio::spawn(async move {
+                    // Acquire semaphore slot
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
                     };
 
-                    crawled.push(page);
-                    tracing::debug!(
-                        url = %entry.url,
-                        pages = crawled.len(),
-                        frontier = self.frontier.len(),
-                        "Page crawled"
-                    );
-                }
-                Err(Error::RateLimited { domain, retry_after_secs }) => {
-                    tracing::warn!(domain, retry_after_secs, "Rate limited, applying backoff");
-                    self.throttle.apply_backoff(&domain);
-                    // Re-queue the URL
-                    self.frontier.push(&entry.url, entry.depth);
-                }
-                Err(e) => {
-                    tracing::warn!(url = %entry.url, error = %e, "Fetch failed");
-                }
+                    // Check if we already have enough
+                    if crawled.lock().await.len() >= max_pages {
+                        return;
+                    }
+
+                    // Throttle per domain
+                    throttle.wait(&entry.domain).await;
+
+                    tracing::debug!(url = %entry.url, depth = entry.depth, "Fetching");
+                    match fetcher.fetch(&entry.url).await {
+                        Ok(result) => {
+                            // Check if search results page
+                            if let Some(search_results) = crate::search_results::parse_search_results(&result.final_url, &result.body) {
+                                tracing::info!(
+                                    url = %entry.url,
+                                    results = search_results.len(),
+                                    "Parsed search results — following links"
+                                );
+                                for sr in &search_results {
+                                    frontier.push(&sr.url, entry.depth);
+                                }
+                                return;
+                            }
+
+                            // Extract links
+                            let links = link_extractor::extract_links(&result.body, &result.final_url);
+                            for link in &links {
+                                if !link.is_external || entry.depth == 0 {
+                                    frontier.push(&link.url, entry.depth + 1);
+                                }
+                            }
+
+                            let page = CrawledPage {
+                                url: entry.url.clone(),
+                                final_url: result.final_url,
+                                body: result.body,
+                                content_type: result.content_type,
+                                status: result.status,
+                                response_time_ms: result.response_time_ms,
+                                depth: entry.depth,
+                                is_spa: result.is_spa,
+                                links,
+                            };
+
+                            let mut pages = crawled.lock().await;
+                            pages.push(page);
+                            tracing::debug!(
+                                url = %entry.url,
+                                pages = pages.len(),
+                                "Page crawled"
+                            );
+                        }
+                        Err(Error::RateLimited { domain, retry_after_secs }) => {
+                            tracing::warn!(domain, retry_after_secs, "Rate limited");
+                            throttle.apply_backoff(&domain);
+                            frontier.push(&entry.url, entry.depth);
+                        }
+                        Err(e) => {
+                            tracing::warn!(url = %entry.url, error = %e, "Fetch failed");
+                        }
+                    }
+                }));
             }
+
+            // Clean up completed handles periodically
+            handles.retain(|h| !h.is_finished());
         }
 
+        // Wait for all in-flight fetches
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        let result = match Arc::try_unwrap(crawled) {
+            Ok(mutex) => mutex.into_inner(),
+            Err(arc) => arc.blocking_lock().clone(),
+        };
+
         tracing::info!(
-            total = crawled.len(),
+            total = result.len(),
             elapsed_ms = start.elapsed().as_millis(),
             "Crawl complete"
         );
 
-        crawled
+        result
     }
 
     /// Fetch a single URL (for atomic `fetch_page` tool).

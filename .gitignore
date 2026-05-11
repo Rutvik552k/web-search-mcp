@@ -8,3 +8,5 @@ server_stderr.log
 deep_research_stderr.log
 deep2_stderr.log
 quick_stderr.log
+crates/orchestrator/data/
+.claude/

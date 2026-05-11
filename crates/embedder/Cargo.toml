@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["candle"]
+no-ml = []  # explicitly disable ML for minimal builds
 onnx = ["ort"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
 

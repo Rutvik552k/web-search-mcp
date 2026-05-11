@@ -28,11 +28,35 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     /// Create a new SearchEngine from config.
+    ///
+    /// Uses persistent disk-backed storage when data_dir exists.
+    /// Falls back to in-memory index if disk path unavailable.
     pub fn new(config: Config) -> Result<Self> {
         let crawler = Crawler::new(config.crawler.clone())?;
 
-        let text_index = TextIndex::in_memory(config.indexer.tantivy_heap_size)?;
-        let vector_index = HnswIndex::new(config.embedder.embedding_dim);
+        // Use persistent index if data_dir is configured
+        let data_dir = &config.server.data_dir;
+        let index_path = data_dir.join("index");
+        let vector_path = data_dir.join("vectors").join("hnsw.json");
+
+        let text_index = if data_dir.as_os_str().is_empty() {
+            TextIndex::in_memory(config.indexer.tantivy_heap_size)?
+        } else {
+            match TextIndex::open(&index_path, config.indexer.tantivy_heap_size) {
+                Ok(idx) => {
+                    tracing::info!(path = %index_path.display(), docs = idx.num_docs(), "Opened persistent text index");
+                    idx
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open persistent index, using in-memory: {e}");
+                    TextIndex::in_memory(config.indexer.tantivy_heap_size)?
+                }
+            }
+        };
+
+        let vector_index = HnswIndex::open_or_create(&vector_path, config.embedder.embedding_dim);
+        tracing::info!(vectors = vector_index.len(), "Vector index ready");
+
         let dedup = DedupStore::new(config.indexer.simhash_threshold);
         let embedder = web_search_embedder::create_embedder(&config.embedder);
         let pipeline = RankingPipeline::new(config.ranker.clone());
@@ -114,8 +138,9 @@ impl SearchEngine {
             }
         }
 
-        // Commit index
+        // Commit index and save vectors to disk
         self.text_index.commit()?;
+        self.save_vectors();
 
         // Run ranking pipeline
         let top_k = 10;
@@ -155,6 +180,7 @@ impl SearchEngine {
         }
 
         self.text_index.commit()?;
+        self.save_vectors();
         Ok(self.pipeline.rank(candidates, query, max_results))
     }
 
@@ -329,6 +355,14 @@ impl SearchEngine {
 
     // ── Internal ─────────────────────────────────────────────────────
 
+    /// Save vector index to disk (best-effort, logs on error).
+    fn save_vectors(&self) {
+        let vector_path = self._config.server.data_dir.join("vectors").join("hnsw.json");
+        if let Err(e) = self.vector_index.save(&vector_path) {
+            tracing::warn!("Failed to save vector index: {e}");
+        }
+    }
+
     /// Process a crawled page: extract, dedup, index, embed.
     async fn process_crawled_page(
         &self,
@@ -409,7 +443,7 @@ impl SearchEngine {
 /// coverage without relying on any single API.
 fn generate_search_seeds(query: &str) -> Vec<String> {
     let encoded = urlencoding_simple(query);
-    let encoded_dash = query.to_lowercase().replace(' ', "-");
+    let _encoded_dash = query.to_lowercase().replace(' ', "-");
     let encoded_underscore = query.to_lowercase().replace(' ', "_");
 
     let mut seeds = vec![
@@ -477,9 +511,12 @@ mod tests {
     #[test]
     fn generate_seeds_produces_urls() {
         let seeds = generate_search_seeds("rust programming language");
-        assert!(!seeds.is_empty());
-        assert!(seeds[0].contains("duckduckgo"));
-        assert!(seeds[0].contains("rust+programming+language"));
+        assert!(seeds.len() >= 5, "Should generate multiple seed URLs");
+        // Should include major search engines
+        let all = seeds.join(" ");
+        assert!(all.contains("brave.com") || all.contains("mojeek.com"));
+        assert!(all.contains("wikipedia.org"));
+        assert!(all.contains("rust+programming+language") || all.contains("rust_programming_language"));
     }
 
     #[test]

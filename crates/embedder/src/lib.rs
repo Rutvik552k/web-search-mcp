@@ -1,4 +1,5 @@
 mod hash_embedder;
+pub mod cross_encoder;
 
 #[cfg(feature = "candle")]
 mod candle_embedder;
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 use web_search_common::Result;
 
 pub use hash_embedder::HashEmbedder;
+pub use cross_encoder::{CrossEncoder, CrossEncoderScore, NliLabel};
 
 #[cfg(feature = "candle")]
 pub use candle_embedder::CandleEmbedder;

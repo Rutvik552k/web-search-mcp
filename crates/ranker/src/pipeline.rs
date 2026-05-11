@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use web_search_common::config::RankerConfig;
 use web_search_common::models::*;
+use web_search_embedder::{CrossEncoder, NliLabel};
 use web_search_indexer::simhash;
 
 use crate::authority;
@@ -11,12 +13,16 @@ use crate::query_type;
 /// 5-stage anti-hallucination ranking pipeline.
 ///
 /// Stage 1: Dual retrieval (BM25 + HNSW) → ISR fusion → top 300
-/// Stage 2: Cross-encoder rerank → top 50 (placeholder: pass-through)
+/// Stage 2: Cross-encoder rerank → top 50
 /// Stage 3: Authority + freshness boost → top 30
 /// Stage 4: Anti-hallucination checks → enrich with confidence metadata
 /// Stage 5: Diversity filter (MMR + domain cap + dedup) → final top K
 pub struct RankingPipeline {
     config: RankerConfig,
+    /// Cross-encoder for Stage 2 reranking (optional — loaded from HuggingFace)
+    reranker: Option<Arc<CrossEncoder>>,
+    /// NLI model for Stage 4 contradiction detection (optional)
+    nli_model: Option<Arc<CrossEncoder>>,
 }
 
 /// Input document for the ranking pipeline.
@@ -37,7 +43,31 @@ pub struct RankCandidate {
 
 impl RankingPipeline {
     pub fn new(config: RankerConfig) -> Self {
-        Self { config }
+        // Try loading cross-encoder reranker
+        let reranker = match CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L-6-v2") {
+            Ok(m) => {
+                tracing::info!(model = m.model_id(), "Cross-encoder reranker loaded (Stage 2 active)");
+                Some(Arc::new(m))
+            }
+            Err(e) => {
+                tracing::warn!("Cross-encoder reranker unavailable, Stage 2 pass-through: {e}");
+                None
+            }
+        };
+
+        // Try loading NLI model
+        let nli_model = match CrossEncoder::new("cross-encoder/nli-deberta-v3-small") {
+            Ok(m) => {
+                tracing::info!(model = m.model_id(), "NLI model loaded (Stage 4 contradiction detection active)");
+                Some(Arc::new(m))
+            }
+            Err(e) => {
+                tracing::warn!("NLI model unavailable, Stage 4 using heuristic fallback: {e}");
+                None
+            }
+        };
+
+        Self { config, reranker, nli_model }
     }
 
     /// Run the full 5-stage pipeline on a set of candidates.
@@ -87,12 +117,44 @@ impl RankingPipeline {
 
         tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: ISR fusion");
 
-        // Stage 2: Cross-encoder rerank (placeholder: keep ISR scores)
-        // TODO: When ONNX cross-encoder model is available, rerank here
+        // Stage 2: Cross-encoder rerank
+        if let Some(reranker) = &self.reranker {
+            // Build (query, doc_body) pairs for cross-encoder scoring
+            let pairs: Vec<(&str, String)> = scored.iter()
+                .map(|(idx, _)| {
+                    let body = &candidates[*idx].body_text;
+                    // Truncate body to ~256 chars for cross-encoder (max_seq ~512 tokens)
+                    let truncated: String = body.chars().take(512).collect();
+                    (query, truncated)
+                })
+                .collect();
+
+            let pair_refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(q, d)| (*q, d.as_str()))
+                .collect();
+
+            match reranker.score_pairs(&pair_refs) {
+                Ok(scores) => {
+                    for (i, ce_score) in scores.iter().enumerate() {
+                        if i < scored.len() {
+                            // Blend ISR score with cross-encoder score
+                            scored[i].1 = 0.3 * scored[i].1 + 0.7 * ce_score.score;
+                        }
+                    }
+                    // Re-sort by blended score
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    tracing::debug!("Stage 2: cross-encoder reranking applied");
+                }
+                Err(e) => {
+                    tracing::warn!("Cross-encoder reranking failed, using ISR only: {e}");
+                }
+            }
+        }
+
         let stage2_limit = self.config.rerank_top_k.min(scored.len());
         scored.truncate(stage2_limit);
 
-        tracing::debug!(stage2_results = scored.len(), "Stage 2 complete: rerank");
+        tracing::debug!(stage2_results = scored.len(), "Stage 2 complete");
 
         // Stage 3: Authority + freshness boost
         for (idx, score) in scored.iter_mut() {
@@ -122,10 +184,22 @@ impl RankingPipeline {
             })
             .collect();
 
-        let hall_check = hallucination::check_hallucination(
+        let mut hall_check = hallucination::check_hallucination(
             &doc_claims,
             self.config.min_unique_orgs,
         );
+
+        // NLI-based contradiction detection (if model available)
+        if let Some(nli) = &self.nli_model {
+            let nli_contradictions = self.run_nli_checks(nli, &scored, &candidates);
+            if !nli_contradictions.is_empty() {
+                tracing::info!(count = nli_contradictions.len(), "NLI contradictions detected");
+                hall_check.contradictions.extend(nli_contradictions);
+                hall_check.warnings.push(format!(
+                    "NLI model detected semantic contradictions across sources"
+                ));
+            }
+        }
 
         tracing::debug!(
             unique_orgs = hall_check.unique_orgs,
@@ -229,6 +303,62 @@ impl RankingPipeline {
             total_time_ms: elapsed,
             query: query.to_string(),
         }
+    }
+}
+
+impl RankingPipeline {
+    /// Run NLI-based contradiction detection across top documents.
+    ///
+    /// Compares key sentences from different sources pairwise.
+    /// If NLI model classifies a pair as "contradiction" with high confidence,
+    /// adds it to the contradictions list.
+    fn run_nli_checks(
+        &self,
+        nli: &CrossEncoder,
+        scored: &[(usize, f32)],
+        candidates: &[RankCandidate],
+    ) -> Vec<Contradiction> {
+        let mut contradictions = Vec::new();
+
+        // Extract first key sentence from each doc
+        let doc_sentences: Vec<(usize, String, String)> = scored.iter()
+            .take(10) // only check top 10 to limit cost
+            .filter_map(|(idx, _)| {
+                let c = &candidates[*idx];
+                let first_sentence = c.body_text
+                    .split(|ch: char| ch == '.' || ch == '!' || ch == '?')
+                    .find(|s| s.trim().split_whitespace().count() >= 8)
+                    .map(|s| s.trim().to_string())?;
+                Some((*idx, first_sentence, c.url.clone()))
+            })
+            .collect();
+
+        // Pairwise NLI comparison (triangular)
+        for i in 0..doc_sentences.len() {
+            for j in (i + 1)..doc_sentences.len() {
+                let (_, ref sent_a, ref url_a) = doc_sentences[i];
+                let (_, ref sent_b, ref url_b) = doc_sentences[j];
+
+                match nli.classify_nli(sent_a, sent_b) {
+                    Ok((NliLabel::Contradiction, conf)) if conf > 0.7 => {
+                        contradictions.push(Contradiction {
+                            claim_a: sent_a.clone(),
+                            source_a: url_a.clone(),
+                            claim_b: sent_b.clone(),
+                            source_b: url_b.clone(),
+                            severity: if conf > 0.9 {
+                                ContradictionSeverity::Hard
+                            } else {
+                                ContradictionSeverity::Soft
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        contradictions
     }
 }
 

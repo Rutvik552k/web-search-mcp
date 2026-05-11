@@ -1,0 +1,48 @@
+[crawler]
+num_workers = 8
+max_concurrent_connections = 500
+requests_per_second_per_domain = 2.0
+request_timeout_secs = 30
+user_agent = "WebSearchMCP/0.1 (research-bot)"
+respect_robots_txt = true
+enable_browser = false
+max_retries = 3
+backoff_base_ms = 1000
+
+[extractor]
+enable_ml_classifier = false
+classifier_model_path = "models/content-clf.onnx"
+min_consensus_votes = 2
+chunk_size_tokens = 512
+chunk_overlap_ratio = 0.2
+
+[indexer]
+index_path = "data/index"
+vector_index_path = "data/vectors"
+tantivy_heap_size = 50000000
+hnsw_m = 16
+hnsw_ef_construction = 200
+simhash_threshold = 3
+enable_pq = false
+
+[embedder]
+embedding_model_path = "models/minilm-l6-v2.onnx"
+embedding_dim = 384
+batch_size = 32
+force_cpu = false
+
+[ranker]
+cross_encoder_model_path = "models/cross-encoder.onnx"
+bm25_top_k = 200
+hnsw_top_k = 200
+rerank_top_k = 50
+min_verification_sources = 3
+mmr_lambda = 0.7
+max_results_per_domain = 2
+min_unique_orgs = 3
+source_tiers_path = "config/source_tiers.toml"
+
+[server]
+name = "web-search-mcp"
+version = "0.1.0"
+data_dir = "data"

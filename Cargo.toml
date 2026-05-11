@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/embedder",
+    "crates/indexer",
+    "crates/crawler",
+    "crates/extractor",
+    "crates/ranker",
+    "crates/orchestrator",
+    "crates/mcp-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-NonCommercial"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error Handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli"] }
+url = "2"
+
+# Search & Indexing
+tantivy = "0.22"
+
+# Data Structures
+dashmap = "6"
+crossbeam = "0.8"
+petgraph = "0.6"
+
+# MCP
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+
+# Internal crates
+web-search-common = { path = "crates/common" }
+web-search-embedder = { path = "crates/embedder" }
+web-search-indexer = { path = "crates/indexer" }
+web-search-crawler = { path = "crates/crawler" }
+web-search-extractor = { path = "crates/extractor" }
+web-search-ranker = { path = "crates/ranker" }
+web-search-orchestrator = { path = "crates/orchestrator" }

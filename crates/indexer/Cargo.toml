@@ -1,0 +1,21 @@
+[package]
+name = "web-search-indexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+web-search-common = { workspace = true }
+web-search-embedder = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tantivy = { workspace = true }
+dashmap = { workspace = true }
+siphasher = "1"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+sha2 = "0.10"
+url = { workspace = true }

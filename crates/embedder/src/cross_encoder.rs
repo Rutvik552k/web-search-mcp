@@ -21,6 +21,8 @@ mod inner {
         model_id: String,
         max_seq_len: usize,
         num_labels: usize,
+        /// Label index mapping for NLI: label_name → index
+        id2label: std::collections::HashMap<usize, String>,
     }
 
     /// Score output from cross-encoder.
@@ -57,7 +59,13 @@ mod inner {
                 .map_err(|e| Error::Embedding(format!("fetch config: {e}")))?;
             let tokenizer_path = repo.get("tokenizer.json")
                 .map_err(|e| Error::Embedding(format!("fetch tokenizer: {e}")))?;
+
+            // Try safetensors first, fall back to pytorch_model.bin conversion
             let weights_path = repo.get("model.safetensors")
+                .or_else(|_| {
+                    tracing::info!("model.safetensors not found, trying pytorch_model.bin");
+                    repo.get("pytorch_model.bin")
+                })
                 .map_err(|e| Error::Embedding(format!("fetch weights: {e}")))?;
 
             // Parse config
@@ -69,14 +77,39 @@ mod inner {
             // Detect num_labels from config JSON
             let config_json: serde_json::Value = serde_json::from_str(&config_str)
                 .map_err(|e| Error::Embedding(format!("parse config json: {e}")))?;
-            let num_labels = config_json["num_labels"].as_u64().unwrap_or(1) as usize;
+            let num_labels = config_json["num_labels"]
+                .as_u64()
+                .or_else(|| config_json["id2label"].as_object().map(|m| m.len() as u64))
+                .unwrap_or(1) as usize;
+
+            // Parse label mapping for NLI models (order varies between models)
+            let id2label: std::collections::HashMap<usize, String> = config_json["id2label"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            let idx = k.parse::<usize>().ok()?;
+                            let label = v.as_str()?.to_lowercase();
+                            Some((idx, label))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| Error::Embedding(format!("load tokenizer: {e}")))?;
 
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
-                    .map_err(|e| Error::Embedding(format!("load weights: {e}")))?
+            // Load weights — support both safetensors and pytorch format
+            let weights_str = weights_path.to_string_lossy().to_string();
+            let vb = if weights_str.ends_with(".safetensors") {
+                unsafe {
+                    VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
+                        .map_err(|e| Error::Embedding(format!("load safetensors: {e}")))?
+                }
+            } else {
+                // pytorch_model.bin — use candle's pth loader
+                VarBuilder::from_pth(&weights_path, DType::F32, &device)
+                    .map_err(|e| Error::Embedding(format!("load pytorch weights: {e}")))?
             };
 
             let model = BertModel::load(vb, &bert_config)
@@ -96,6 +129,7 @@ mod inner {
                 model_id: model_id.to_string(),
                 max_seq_len: bert_config.max_position_embeddings,
                 num_labels,
+                id2label,
             })
         }
 
@@ -193,6 +227,9 @@ mod inner {
         }
 
         /// Classify NLI label for a single pair.
+        ///
+        /// Uses model's id2label mapping to correctly identify which index
+        /// corresponds to contradiction/entailment/neutral (varies between models).
         pub fn classify_nli(&self, premise: &str, hypothesis: &str) -> Result<(NliLabel, f32)> {
             let scores = self.score_pairs(&[(premise, hypothesis)])?;
             let score = scores.into_iter().next()
@@ -204,12 +241,42 @@ mod inner {
             }
 
             let sm = softmax(logits);
-            let (label, conf) = if sm[0] > sm[1] && sm[0] > sm[2] {
-                (NliLabel::Contradiction, sm[0])
-            } else if sm[2] > sm[0] && sm[2] > sm[1] {
-                (NliLabel::Entailment, sm[2])
+
+            // Find which index maps to which label using id2label
+            let mut contradiction_idx = 0;
+            let mut entailment_idx = 2;
+            let mut neutral_idx = 1;
+
+            for (idx, label) in &self.id2label {
+                match label.as_str() {
+                    "contradiction" => contradiction_idx = *idx,
+                    "entailment" => entailment_idx = *idx,
+                    "neutral" => neutral_idx = *idx,
+                    _ => {}
+                }
+            }
+
+            let (label, conf) = if sm.len() > contradiction_idx.max(entailment_idx).max(neutral_idx) {
+                let c_score = sm[contradiction_idx];
+                let e_score = sm[entailment_idx];
+                let n_score = sm[neutral_idx];
+
+                if c_score > e_score && c_score > n_score {
+                    (NliLabel::Contradiction, c_score)
+                } else if e_score > c_score && e_score > n_score {
+                    (NliLabel::Entailment, e_score)
+                } else {
+                    (NliLabel::Neutral, n_score)
+                }
             } else {
-                (NliLabel::Neutral, sm[1])
+                // Fallback: hardcoded order
+                if sm[0] > sm[1] && sm[0] > sm[2] {
+                    (NliLabel::Contradiction, sm[0])
+                } else if sm[2] > sm[0] && sm[2] > sm[1] {
+                    (NliLabel::Entailment, sm[2])
+                } else {
+                    (NliLabel::Neutral, sm[1])
+                }
             };
 
             Ok((label, conf))

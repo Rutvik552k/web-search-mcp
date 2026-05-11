@@ -4,6 +4,7 @@ pub mod link_extractor;
 pub mod pagination;
 pub mod robots;
 pub mod search_results;
+pub mod sitemap;
 pub mod throttle;
 pub mod crawler;
 

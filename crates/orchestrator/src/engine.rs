@@ -57,7 +57,9 @@ impl SearchEngine {
         let vector_index = HnswIndex::open_or_create(&vector_path, config.embedder.embedding_dim);
         tracing::info!(vectors = vector_index.len(), "Vector index ready");
 
-        let dedup = DedupStore::new(config.indexer.simhash_threshold);
+        let dedup_path = data_dir.join("dedup.json");
+        let dedup = DedupStore::open_or_create(&dedup_path, config.indexer.simhash_threshold);
+        tracing::info!(urls = dedup.len(), "Dedup state ready");
         let embedder = web_search_embedder::create_embedder(&config.embedder);
         let pipeline = RankingPipeline::new(config.ranker.clone());
 
@@ -87,9 +89,14 @@ impl SearchEngine {
 
         tracing::info!(query, max_pages, max_depth, "Starting deep research");
 
-        // Generate seed URLs from query
-        let seeds = generate_search_seeds(query);
+        // Generate seed URLs from query + reformulated variants
+        let query_variants = crate::query::reformulate_query(query);
+        let seeds: Vec<String> = query_variants
+            .iter()
+            .flat_map(|q| generate_search_seeds(q))
+            .collect();
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+        tracing::info!(seed_count = seeds.len(), variants = query_variants.len(), "Generated search seeds");
 
         // Wave 1: Broad crawl
         let wave1_limit = (max_pages / 2).max(10);
@@ -142,6 +149,9 @@ impl SearchEngine {
         self.text_index.commit()?;
         self.save_vectors();
 
+        // Run hybrid search: BM25 + vector ranks merged onto candidates
+        self.apply_hybrid_ranks(&mut candidates, query).await;
+
         // Run ranking pipeline
         let top_k = 10;
         let response = self.pipeline.rank(candidates, query, top_k);
@@ -181,6 +191,7 @@ impl SearchEngine {
 
         self.text_index.commit()?;
         self.save_vectors();
+        self.apply_hybrid_ranks(&mut candidates, query).await;
         Ok(self.pipeline.rank(candidates, query, max_results))
     }
 
@@ -355,12 +366,49 @@ impl SearchEngine {
 
     // ── Internal ─────────────────────────────────────────────────────
 
-    /// Save vector index to disk (best-effort, logs on error).
+    /// Save vector index + dedup state to disk (best-effort).
     fn save_vectors(&self) {
         let vector_path = self._config.server.data_dir.join("vectors").join("hnsw.json");
         if let Err(e) = self.vector_index.save(&vector_path) {
             tracing::warn!("Failed to save vector index: {e}");
         }
+        let dedup_path = self._config.server.data_dir.join("dedup.json");
+        if let Err(e) = self.dedup.save(&dedup_path) {
+            tracing::warn!("Failed to save dedup state: {e}");
+        }
+    }
+
+    /// Apply hybrid BM25 + vector ranks to candidates after indexing.
+    ///
+    /// Queries both tantivy (BM25) and HNSW (vector) indexes,
+    /// then sets bm25_rank/vector_rank/scores on matching candidates.
+    async fn apply_hybrid_ranks(&self, candidates: &mut [RankCandidate], query: &str) {
+        // BM25 search
+        let bm25_limit = candidates.len().max(50);
+        if let Ok(bm25_results) = self.text_index.search(query, bm25_limit) {
+            for (rank, result) in bm25_results.iter().enumerate() {
+                if let Some(c) = candidates.iter_mut().find(|c| c.url == result.url) {
+                    c.bm25_rank = Some(rank + 1);
+                    c.bm25_score = Some(result.score);
+                }
+            }
+        }
+
+        // Vector search
+        if let Ok(query_vec) = self.embedder.embed_one(query).await {
+            let vec_limit = candidates.len().max(50);
+            if let Ok(vec_results) = self.vector_index.search(&query_vec, vec_limit) {
+                for (rank, result) in vec_results.iter().enumerate() {
+                    if let Some(c) = candidates.iter_mut().find(|c| c.url == result.doc_id) {
+                        c.vector_rank = Some(rank + 1);
+                        c.vector_score = Some(result.score);
+                    }
+                }
+            }
+        }
+
+        let ranked = candidates.iter().filter(|c| c.bm25_rank.is_some() || c.vector_rank.is_some()).count();
+        tracing::info!(ranked, total = candidates.len(), "Hybrid ranks applied");
     }
 
     /// Process a crawled page: extract, dedup, index, embed.
@@ -368,6 +416,13 @@ impl SearchEngine {
         &self,
         crawled: &web_search_crawler::crawler::CrawledPage,
     ) -> Option<RankCandidate> {
+        // Skip non-HTML content types (PDF, images, etc.)
+        let ct = crawled.content_type.to_lowercase();
+        if !ct.contains("html") && !ct.contains("text/plain") && !ct.contains("xml") {
+            tracing::debug!(url = %crawled.final_url, content_type = %ct, "Skipping non-HTML content");
+            return None;
+        }
+
         // Dedup check
         let dedup_result = self.dedup.check_and_register(&crawled.final_url, &crawled.body);
         match dedup_result {

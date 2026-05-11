@@ -199,7 +199,7 @@ impl RankingPipeline {
                 };
 
                 RankedResult {
-                    content: c.body_text.chars().take(2000).collect(),
+                    content: web_search_extractor::extract_snippet(&c.body_text, query, 1500),
                     url: c.url.clone(),
                     title: c.title.clone(),
                     confidence,

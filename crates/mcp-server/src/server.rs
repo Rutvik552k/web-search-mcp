@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo,
@@ -10,7 +11,7 @@ use web_search_orchestrator::SearchEngine;
 use crate::tools::tool_definitions;
 
 pub struct WebSearchServer {
-    engine: SearchEngine,
+    engine: Arc<SearchEngine>,
 }
 
 impl WebSearchServer {
@@ -18,7 +19,7 @@ impl WebSearchServer {
         let config = Config::load(std::path::Path::new("config/default.toml"))
             .unwrap_or_else(|_| Config::default());
 
-        let engine = SearchEngine::new(config)?;
+        let engine = Arc::new(SearchEngine::new(config)?);
 
         tracing::info!("WebSearchServer initialized");
         Ok(Self { engine })

@@ -1,10 +1,12 @@
 pub mod chunker;
 pub mod metadata;
 pub mod readability;
+pub mod snippet;
 pub mod trafilatura;
 pub mod consensus;
 
 pub use consensus::extract_page;
+pub use snippet::extract_snippet;
 
 use chrono::{DateTime, Utc};
 use web_search_common::models::{Heading, Link, Table, OpenGraphData};

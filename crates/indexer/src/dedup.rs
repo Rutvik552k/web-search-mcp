@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use web_search_common::Result;
 
 use crate::simhash;
 
@@ -104,6 +105,80 @@ impl DedupStore {
         self.exact_hashes.clear();
         self.simhash_fps.clear();
         self.seen_urls.clear();
+    }
+
+    /// Save dedup state to a JSON file.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let urls: Vec<String> = self.seen_urls.iter().map(|e| e.key().clone()).collect();
+        let hashes: Vec<(String, String)> = self
+            .exact_hashes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let fps: Vec<(String, u64)> = self
+            .simhash_fps
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+
+        let data = serde_json::json!({
+            "threshold": self.simhash_threshold,
+            "urls": urls,
+            "hashes": hashes,
+            "fingerprints": fps,
+        });
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(serde_json::to_vec(&data)?.as_slice())?;
+        Ok(())
+    }
+
+    /// Load dedup state from a JSON file.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let data = std::fs::read(path)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&data)?;
+
+        let threshold = parsed["threshold"].as_u64().unwrap_or(3) as u32;
+        let store = DedupStore::new(threshold);
+
+        if let Some(urls) = parsed["urls"].as_array() {
+            for u in urls {
+                if let Some(s) = u.as_str() {
+                    store.seen_urls.insert(s.to_string(), ());
+                }
+            }
+        }
+        if let Some(hashes) = parsed["hashes"].as_array() {
+            for h in hashes {
+                if let (Some(k), Some(v)) = (h[0].as_str(), h[1].as_str()) {
+                    store.exact_hashes.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        if let Some(fps) = parsed["fingerprints"].as_array() {
+            for f in fps {
+                if let (Some(k), Some(v)) = (f[0].as_str(), f[1].as_u64()) {
+                    store.simhash_fps.insert(k.to_string(), v);
+                }
+            }
+        }
+
+        Ok(store)
+    }
+
+    /// Load from file if exists, otherwise create new.
+    pub fn open_or_create(path: &std::path::Path, threshold: u32) -> Self {
+        match Self::load(path) {
+            Ok(s) => {
+                tracing::info!(urls = s.len(), "Loaded dedup state from disk");
+                s
+            }
+            Err(_) => Self::new(threshold),
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod fetcher;
 pub mod frontier;
 pub mod link_extractor;
@@ -8,6 +9,7 @@ pub mod sitemap;
 pub mod throttle;
 pub mod crawler;
 
+pub use browser::BrowserPool;
 pub use crawler::Crawler;
 pub use fetcher::{FetchResult, Fetcher};
 pub use frontier::UrlFrontier;

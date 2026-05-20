@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use web_search_common::config::Config;
 use web_search_common::models::*;
 use web_search_common::Result;
+use crate::synthesis;
 use web_search_crawler::Crawler;
 use web_search_embedder::{self, Embedder};
 use web_search_extractor::{self, consensus};
@@ -145,13 +146,8 @@ impl SearchEngine {
         tracing::info!(wave1_pages = pages.len(), "Wave 1 complete");
         self.send_progress(2, Some(5), &format!("Wave 1 complete: {} pages crawled, extracting content", pages.len()));
 
-        // Process crawled pages
-        let mut candidates = Vec::new();
-        for page in &pages {
-            if let Some(candidate) = self.process_crawled_page(page).await {
-                candidates.push(candidate);
-            }
-        }
+        // Process crawled pages (batch extract + batch embed)
+        let mut candidates = self.process_pages_batch(&pages).await;
 
         // Wave 2: Follow best links from wave 1 results
         if start.elapsed() < time_limit && candidates.len() < max_pages {
@@ -178,11 +174,8 @@ impl SearchEngine {
                 tracing::info!(wave2_pages = wave2_pages.len(), "Wave 2 complete");
                 self.send_progress(3, Some(5), &format!("Wave 2 complete: {} additional pages", wave2_pages.len()));
 
-                for page in &wave2_pages {
-                    if let Some(candidate) = self.process_crawled_page(page).await {
-                        candidates.push(candidate);
-                    }
-                }
+                let wave2_candidates = self.process_pages_batch(&wave2_pages).await;
+                candidates.extend(wave2_candidates);
             }
         }
 
@@ -196,7 +189,10 @@ impl SearchEngine {
 
         // Run ranking pipeline
         let top_k = 10;
-        let response = self.pipeline.rank(candidates, query, top_k);
+        let mut response = self.pipeline.rank(candidates, query, top_k);
+
+        // Apply TF-IDF synthesis across results
+        self.apply_synthesis(&mut response);
 
         self.send_progress(5, Some(5), &format!(
             "Deep research complete: {} results from {} pages in {}ms",
@@ -229,17 +225,14 @@ impl SearchEngine {
             Duration::from_secs(15),
         ).await;
 
-        let mut candidates = Vec::new();
-        for page in &pages {
-            if let Some(candidate) = self.process_crawled_page(page).await {
-                candidates.push(candidate);
-            }
-        }
+        let mut candidates = self.process_pages_batch(&pages).await;
 
         self.text_index.commit()?;
         self.save_vectors();
         self.apply_hybrid_ranks(&mut candidates, query).await;
-        Ok(self.pipeline.rank(candidates, query, max_results))
+        let mut response = self.pipeline.rank(candidates, query, max_results);
+        self.apply_synthesis(&mut response);
+        Ok(response)
     }
 
     /// Verify a claim by searching for supporting/contradicting evidence.
@@ -434,6 +427,24 @@ impl SearchEngine {
         }))?)
     }
 
+    /// Apply TF-IDF extractive synthesis to a search response.
+    /// Extracts top-5 most informative sentences across all results.
+    fn apply_synthesis(&self, response: &mut SearchResponse) {
+        let docs: Vec<(&str, &str, &str)> = response.results.iter()
+            .map(|r| (r.content.as_str(), r.url.as_str(), r.title.as_str()))
+            .collect();
+
+        let scored = synthesis::synthesize_tfidf(&docs, 5);
+        response.synthesis = scored.into_iter()
+            .map(|s| SynthesizedSentence {
+                text: s.text,
+                score: s.score,
+                source_url: s.source_url,
+                source_title: s.source_title,
+            })
+            .collect();
+    }
+
     // ── Internal ─────────────────────────────────────────────────────
 
     /// Save vector index + dedup state to disk (best-effort).
@@ -481,16 +492,78 @@ impl SearchEngine {
         tracing::info!(ranked, total = candidates.len(), "Hybrid ranks applied");
     }
 
-    /// Process a crawled page: extract, dedup, index, embed.
-    async fn process_crawled_page(
+    /// Process crawled pages in bulk: extract, dedup, index, then batch embed.
+    ///
+    /// Two-phase approach:
+    /// Phase 1: Extract + dedup + index (fast, no ML) — per page
+    /// Phase 2: Batch embed all texts at once (1 ML call instead of N)
+    async fn process_pages_batch(
+        &self,
+        pages: &[web_search_crawler::crawler::CrawledPage],
+    ) -> Vec<RankCandidate> {
+        let extract_start = std::time::Instant::now();
+
+        // Phase 1: Extract + dedup + index (no embedding yet)
+        let mut pre_candidates: Vec<(RankCandidate, String)> = Vec::new(); // (candidate, body_text for embedding)
+
+        for crawled in pages {
+            if let Some((candidate, body_for_embed)) = self.extract_and_index(crawled) {
+                pre_candidates.push((candidate, body_for_embed));
+            }
+        }
+
+        let extract_ms = extract_start.elapsed().as_millis();
+        tracing::info!(
+            pages = pages.len(),
+            candidates = pre_candidates.len(),
+            extract_ms,
+            "Phase 1: extraction + indexing complete"
+        );
+
+        if pre_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 2: Batch embed all texts in one call
+        let embed_start = std::time::Instant::now();
+        let texts: Vec<&str> = pre_candidates.iter().map(|(_, t)| t.as_str()).collect();
+
+        let text_count = texts.len();
+        match self.embedder.embed(&texts).await {
+            Ok(embeddings) => {
+                drop(texts); // release borrow on pre_candidates
+                for (i, (candidate, _)) in pre_candidates.iter_mut().enumerate() {
+                    if let Some(vec) = embeddings.get(i) {
+                        if let Err(e) = self.vector_index.insert(&candidate.url, vec.clone()) {
+                            tracing::warn!(url = %candidate.url, error = %e, "Vector insert failed");
+                        }
+                        candidate.embedding = Some(vec.clone());
+                    }
+                }
+                let embed_ms = embed_start.elapsed().as_millis();
+                tracing::info!(
+                    texts = text_count,
+                    embed_ms,
+                    "Phase 2: batch embedding complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Batch embedding failed, candidates will lack vectors");
+            }
+        }
+
+        pre_candidates.into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// Phase 1 of page processing: extract, dedup, index. No ML.
+    /// Returns (candidate_without_embedding, body_text_for_embedding).
+    fn extract_and_index(
         &self,
         crawled: &web_search_crawler::crawler::CrawledPage,
-    ) -> Option<RankCandidate> {
-        // Skip non-HTML content types (PDF, images, etc.)
+    ) -> Option<(RankCandidate, String)> {
+        // Skip non-HTML
         let ct = crawled.content_type.to_lowercase();
         if !ct.contains("html") && !ct.contains("text/plain") && !ct.contains("xml") {
-            // JSON API responses are handled by the crawler for link following,
-            // but not indexable as content pages
             if ct.contains("json") {
                 tracing::debug!(url = %crawled.final_url, "Skipping JSON content (not indexable)");
             } else {
@@ -512,18 +585,17 @@ impl SearchEngine {
         // Extract content
         let extraction = consensus::extract_page(&crawled.body, &crawled.final_url);
 
-        if extraction.body_text.len() < 50 {
-            tracing::debug!(url = %crawled.final_url, "Skipping: too little content");
+        if extraction.body_text.len() < 30 {
+            tracing::debug!(url = %crawled.final_url, len = extraction.body_text.len(), "Skipping: too little content");
             return None;
         }
 
-        // Content quality filter: reject error pages, empty search results, and boilerplate
         if is_low_quality_content(&extraction.body_text, &crawled.final_url) {
             tracing::debug!(url = %crawled.final_url, "Skipping: low quality / error page");
             return None;
         }
 
-        // Build Page model
+        // Build Page model + index in tantivy
         let content_hash = sha256_short(&crawled.body);
         let domain = extract_domain(&crawled.final_url);
         let page = consensus::to_page(
@@ -536,29 +608,14 @@ impl SearchEngine {
             crawled.body.len(),
         );
 
-        // Index in tantivy
         if let Err(e) = self.text_index.add_page(&page) {
             tracing::warn!(url = %crawled.final_url, error = %e, "Index add failed");
         }
 
-        // Embed and add to vector index
-        let embedding = match self.embedder.embed_one(&extraction.body_text).await {
-            Ok(vec) => {
-                if let Err(e) = self.vector_index.insert(&crawled.final_url, vec.clone()) {
-                    tracing::warn!(url = %crawled.final_url, error = %e, "Vector insert failed");
-                }
-                Some(vec)
-            }
-            Err(e) => {
-                tracing::debug!(url = %crawled.final_url, error = %e, "Embedding failed");
-                None
-            }
-        };
-
-        // Build ranking candidate
         let source_tier = authority::classify_domain(&domain);
+        let body_for_embed = extraction.body_text.clone();
 
-        Some(RankCandidate {
+        let candidate = RankCandidate {
             url: crawled.final_url.clone(),
             domain,
             title: extraction.title.unwrap_or_default(),
@@ -569,8 +626,10 @@ impl SearchEngine {
             vector_score: None,
             bm25_rank: None,
             vector_rank: None,
-            embedding,
-        })
+            embedding: None, // filled in Phase 2
+        };
+
+        Some((candidate, body_for_embed))
     }
 }
 
@@ -602,6 +661,9 @@ fn generate_search_seeds(query: &str) -> Vec<String> {
         format!("https://arxiv.org/search/?query={encoded}&searchtype=all"),
         // Hacker News — use Algolia API (returns JSON, SPA frontend is unscrapable)
         format!("https://hn.algolia.com/api/v1/search?query={encoded}&tags=story"),
+        // SearXNG metasearch — aggregates Google/Bing/DDG without CAPTCHA (JSON API)
+        format!("https://search.sapti.me/search?q={encoded}&format=json&categories=general"),
+        format!("https://searx.tiekoetter.com/search?q={encoded}&format=json&categories=general"),
     ];
 
     // Add topic-specific sources based on query keywords
@@ -641,7 +703,8 @@ fn is_low_quality_content(body: &str, url: &str) -> bool {
     let word_count = body.split_whitespace().count();
 
     // Too short to be useful content (after extraction)
-    if word_count < 30 {
+    // Relaxed from 30 — some legitimate pages (API docs, changelogs) are short
+    if word_count < 15 {
         return true;
     }
 
@@ -674,8 +737,14 @@ fn is_low_quality_content(body: &str, url: &str) -> bool {
         "checking your browser",
         "just a moment...",
     ];
-    if block_phrases.iter().any(|p| lower.contains(p)) && word_count < 200 {
-        return true;
+    // Only reject CAPTCHA pages if they're truly just a challenge page
+    // Raised from 200 — some real pages mention "enable javascript" in footers
+    if block_phrases.iter().any(|p| lower.contains(p)) && word_count < 500 {
+        // Double-check: if the page has substantial content beyond the block phrase, keep it
+        let block_count = block_phrases.iter().filter(|p| lower.contains(*p)).count();
+        if block_count >= 2 || word_count < 100 {
+            return true;
+        }
     }
 
     // Search result listing pages that leaked through (Wikidata, generic search pages)

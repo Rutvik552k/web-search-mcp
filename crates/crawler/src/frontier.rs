@@ -5,13 +5,31 @@ use parking_lot::Mutex;
 
 /// Priority URL frontier for crawl scheduling.
 ///
-/// URLs are prioritized by: depth (shallow first), domain authority, freshness.
+/// URLs scored by: depth (shallow first) + source authority + domain diversity.
 /// Tracks per-domain counts to enforce max_pages_per_domain.
 pub struct UrlFrontier {
     queue: Mutex<BinaryHeap<PrioritizedUrl>>,
     seen: DashMap<String, ()>,
     domain_counts: DashMap<String, usize>,
     max_per_domain: usize,
+}
+
+/// Known high-authority domains get priority boost in the frontier.
+fn domain_authority_bonus(domain: &str) -> f32 {
+    // Tier 1: academic, government, major reference
+    let tier1 = [".gov", ".edu", "nature.com", "arxiv.org", "pubmed.", "ieee.org", "who.int", "nasa.gov"];
+    if tier1.iter().any(|t| domain.contains(t)) { return 0.3; }
+
+    // Tier 2: established tech/news
+    let tier2 = ["wikipedia.org", "stackoverflow.com", "github.com", "bbc.", "reuters.",
+                  "nytimes.com", "docs.rs", "developer.mozilla.org", "rust-lang.org"];
+    if tier2.iter().any(|t| domain.contains(t)) { return 0.2; }
+
+    // Tier 3: known content sites
+    let tier3 = ["medium.com", "dev.to", "reddit.com", "hackernews", "substack.com"];
+    if tier3.iter().any(|t| domain.contains(t)) { return 0.1; }
+
+    0.0
 }
 
 #[derive(Debug, Clone)]
@@ -72,9 +90,11 @@ impl UrlFrontier {
             return false;
         }
 
-        // Calculate priority: shallower = higher priority
-        let depth_score = 1.0 / (depth as f32 + 1.0);
-        let priority = depth_score;
+        // Composite priority: depth + authority + domain diversity
+        let depth_score = 1.0 / (depth as f32 + 1.0);     // 1.0 at depth 0, 0.5 at depth 1
+        let authority = domain_authority_bonus(&domain);     // 0.0 - 0.3
+        let diversity = 1.0 / (count as f32 + 1.0);         // high when domain is fresh (few pages)
+        let priority = depth_score + authority + diversity * 0.2;
 
         self.seen.insert(normalized.clone(), ());
         *self.domain_counts.entry(domain.clone()).or_insert(0) += 1;

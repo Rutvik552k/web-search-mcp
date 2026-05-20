@@ -161,10 +161,22 @@ pub struct RankedResult {
     pub relevance_score: f32,
 }
 
+/// A synthesized sentence extracted from search results via TF-IDF scoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynthesizedSentence {
+    pub text: String,
+    pub score: f32,
+    pub source_url: String,
+    pub source_title: String,
+}
+
 /// The complete response from a search/research operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<RankedResult>,
+    /// TF-IDF extractive synthesis: top sentences across all results, ranked by informativeness
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synthesis: Vec<SynthesizedSentence>,
     pub warnings: Vec<String>,
     pub coverage_score: f32,
     pub total_pages_crawled: usize,

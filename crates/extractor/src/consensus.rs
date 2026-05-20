@@ -84,9 +84,12 @@ pub fn extract_page(html: &str, url: &str) -> ExtractionResult {
     // Sanitize HTML before extraction
     let clean_html = sanitize_html(html);
 
-    // Run both extraction passes on sanitized HTML
-    let traf_result = trafilatura::extract(&clean_html);
-    let read_result = readability::extract(&clean_html);
+    // Run both extraction passes in parallel (saves ~50-150ms per page)
+    let clean_for_read = clean_html.clone();
+    let (traf_result, read_result) = rayon::join(
+        || trafilatura::extract(&clean_html),
+        || readability::extract(&clean_for_read),
+    );
 
     // Pick best body text by confidence, then clean
     let (body_text, confidence) = if traf_result.confidence >= read_result.confidence {

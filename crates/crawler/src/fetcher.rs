@@ -1,5 +1,7 @@
+use crate::browser::BrowserPool;
 use moka::future::Cache;
 use reqwest::{Client, StatusCode};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use web_search_common::config::CrawlerConfig;
@@ -31,7 +33,7 @@ pub struct CacheStats {
     pub entries: u64,
 }
 
-/// HTTP fetcher with retry, headers, SPA detection, and response caching.
+/// HTTP fetcher with retry, headers, SPA detection, response caching, and browser fallback.
 pub struct Fetcher {
     client: Client,
     max_retries: u32,
@@ -40,6 +42,10 @@ pub struct Fetcher {
     cache: Cache<String, CachedResponse>,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Headless browser pool for SPA/JS rendering fallback
+    browser_pool: Arc<BrowserPool>,
+    /// Whether to attempt browser fallback on SPA-detected pages
+    enable_browser: bool,
 }
 
 /// Cached HTTP response with conditional request headers.
@@ -76,6 +82,8 @@ impl Fetcher {
             .time_to_live(Duration::from_secs(600))
             .build();
 
+        let browser_pool = BrowserPool::new();
+
         Ok(Self {
             client,
             max_retries: config.max_retries,
@@ -83,6 +91,8 @@ impl Fetcher {
             cache,
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            browser_pool,
+            enable_browser: config.enable_browser,
         })
     }
 
@@ -118,6 +128,14 @@ impl Fetcher {
 
             match self.fetch_once(url).await {
                 Ok(result) => {
+                    // If SPA detected and browser enabled, try browser fallback
+                    let result = if result.is_spa && self.enable_browser {
+                        tracing::info!(url, "SPA detected, attempting browser render");
+                        self.try_browser_fallback(url, result).await
+                    } else {
+                        result
+                    };
+
                     // Cache the response
                     let cached = CachedResponse {
                         etag: result.etag.clone(),
@@ -223,6 +241,60 @@ impl Fetcher {
             from_cache: false,
             etag,
             last_modified,
+        })
+    }
+
+    /// Try browser fallback when SPA is detected.
+    /// Replaces the HTTP result body with browser-rendered HTML.
+    async fn try_browser_fallback(&self, url: &str, http_result: FetchResult) -> FetchResult {
+        match self.browser_pool.fetch(url, Duration::from_secs(15)).await {
+            Some(browser_result) if browser_result.body.len() > http_result.body.len() / 2 => {
+                tracing::info!(
+                    url,
+                    http_len = http_result.body.len(),
+                    browser_len = browser_result.body.len(),
+                    "Browser rendered more content, using browser result"
+                );
+                FetchResult {
+                    url: http_result.url,
+                    final_url: browser_result.final_url,
+                    status: http_result.status,
+                    content_type: http_result.content_type,
+                    body: browser_result.body,
+                    response_time_ms: http_result.response_time_ms,
+                    content_length: http_result.content_length,
+                    is_spa: false, // rendered, no longer SPA
+                    from_cache: false,
+                    etag: http_result.etag,
+                    last_modified: http_result.last_modified,
+                }
+            }
+            _ => {
+                tracing::debug!(url, "Browser fallback didn't improve content, keeping HTTP result");
+                http_result
+            }
+        }
+    }
+
+    /// Explicitly fetch a URL via browser (for search engines that need JS).
+    /// Used by crawler when search parser returns 0 results.
+    pub async fn fetch_via_browser(&self, url: &str) -> Option<FetchResult> {
+        if !self.enable_browser {
+            return None;
+        }
+        let result = self.browser_pool.fetch(url, Duration::from_secs(20)).await?;
+        Some(FetchResult {
+            url: url.to_string(),
+            final_url: result.final_url,
+            status: result.status,
+            content_type: "text/html".to_string(),
+            body: result.body,
+            response_time_ms: 0,
+            content_length: 0,
+            is_spa: false,
+            from_cache: false,
+            etag: None,
+            last_modified: None,
         })
     }
 

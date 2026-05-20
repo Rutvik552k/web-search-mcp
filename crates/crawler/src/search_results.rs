@@ -31,6 +31,8 @@ pub fn parse_search_results(url: &str, html: &str) -> Option<Vec<SearchResult>> 
         d if d.contains("hn.algolia.com") || d.contains("algolia.com") => Some("hackernews"),
         d if d.contains("scholar.google.com") => Some("scholar"),
         d if d.contains("pubmed.ncbi.nlm.nih.gov") => Some("pubmed"),
+        // SearXNG metasearch instances (JSON API)
+        d if url.contains("format=json") && (d.contains("searx") || d.contains("search.")) => Some("searxng"),
         _ => None,
     };
 
@@ -47,6 +49,7 @@ pub fn parse_search_results(url: &str, html: &str) -> Option<Vec<SearchResult>> 
         "hackernews" => parse_hackernews(html),
         "scholar" => parse_google_scholar(html),
         "pubmed" => parse_pubmed(html),
+        "searxng" => parse_searxng(html),
         _ => return None,
     };
 
@@ -298,8 +301,12 @@ fn parse_duckduckgo(html: &str) -> Vec<SearchResult> {
     let mut seen = HashSet::new();
 
     // Try multiple selectors — DDG changes DOM frequently
-    // Classic HTML version: <a class="result__a">, also try .result-link, .result__url
+    // 2026 update: DDG HTML lite uses #links .result containers
     let selectors = [
+        // 2026 DDG HTML lite: #links > .result container
+        "#links .result a[href]",
+        ".result a.result__a[href]",
+        // Classic selectors
         "a.result__a[href]",
         "a.result-link[href]",
         ".result__url a[href]",
@@ -312,6 +319,9 @@ fn parse_duckduckgo(html: &str) -> Vec<SearchResult> {
         ".links_main a[href]",
         // Zero-click result
         ".zci__main a[href]",
+        // Additional fallback patterns
+        ".result__body a[href]",
+        ".result__snippet a[href]",
     ];
 
     for sel_str in &selectors {
@@ -805,6 +815,42 @@ fn parse_pubmed(html: &str) -> Vec<SearchResult> {
     }
 
     results.truncate(10);
+    results
+}
+
+/// Parse SearXNG JSON API response.
+///
+/// SearXNG returns JSON when `format=json` is in the URL.
+/// Response format: { "results": [ { "url": "...", "title": "...", "content": "..." }, ... ] }
+fn parse_searxng(body: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(items) = json["results"].as_array() {
+            for item in items {
+                let url = match item["url"].as_str() {
+                    Some(u) if u.starts_with("http") => u,
+                    _ => continue,
+                };
+
+                if !seen.insert(url.to_string()) || is_noise_url(url) {
+                    continue;
+                }
+
+                let title = item["title"].as_str().unwrap_or("").to_string();
+                let snippet = item["content"].as_str().unwrap_or("").to_string();
+
+                results.push(SearchResult {
+                    url: url.to_string(),
+                    title,
+                    snippet,
+                });
+            }
+        }
+    }
+
+    results.truncate(20);
     results
 }
 

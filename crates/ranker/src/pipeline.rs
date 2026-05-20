@@ -318,6 +318,7 @@ impl RankingPipeline {
 
         SearchResponse {
             results,
+            synthesis: vec![], // populated by orchestrator after ranking
             warnings: hall_check.warnings,
             coverage_score: hall_check.unique_orgs as f32 / self.config.min_unique_orgs as f32,
             total_pages_crawled: total_input,

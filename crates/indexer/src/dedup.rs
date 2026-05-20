@@ -4,20 +4,22 @@ use web_search_common::Result;
 
 use crate::simhash;
 
-/// Multi-level deduplication store.
+/// Multi-level deduplication store with TTL.
 ///
-/// Level 1: Exact — SHA-256 content hash
-/// Level 2: Near  — SimHash 64-bit fingerprint, hamming ≤ threshold
-/// Level 3: URL   — exact URL dedup
+/// Level 1: Exact — SHA-256 content hash (permanent)
+/// Level 2: Near  — SimHash 64-bit fingerprint, hamming ≤ threshold (permanent)
+/// Level 3: URL   — exact URL dedup with TTL (expires after url_ttl_secs)
 pub struct DedupStore {
-    /// SHA-256 content hashes
+    /// SHA-256 content hashes (permanent — same content is always duplicate)
     exact_hashes: DashMap<String, String>, // hash → url
-    /// SimHash fingerprints
+    /// SimHash fingerprints (permanent)
     simhash_fps: DashMap<String, u64>, // url → simhash
-    /// Seen URLs
-    seen_urls: DashMap<String, ()>,
+    /// Seen URLs with timestamp for TTL expiry
+    seen_urls: DashMap<String, u64>, // url → unix epoch when seen
     /// Hamming distance threshold for near-duplicate
     simhash_threshold: u32,
+    /// URL dedup TTL in seconds (0 = never expire)
+    url_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,14 +44,44 @@ impl DedupStore {
             simhash_fps: DashMap::new(),
             seen_urls: DashMap::new(),
             simhash_threshold,
+            url_ttl_secs: 3600, // 1 hour default
         }
     }
 
+    /// Create with custom URL TTL.
+    pub fn with_ttl(simhash_threshold: u32, url_ttl_secs: u64) -> Self {
+        Self {
+            exact_hashes: DashMap::new(),
+            simhash_fps: DashMap::new(),
+            seen_urls: DashMap::new(),
+            simhash_threshold,
+            url_ttl_secs,
+        }
+    }
+
+    fn now_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn is_url_expired(&self, timestamp: u64) -> bool {
+        if self.url_ttl_secs == 0 { return false; }
+        Self::now_epoch().saturating_sub(timestamp) > self.url_ttl_secs
+    }
+
     /// Check if content is a duplicate. If unique, registers it.
+    /// URL dedup respects TTL — expired URLs are re-crawlable.
     pub fn check_and_register(&self, url: &str, content: &str) -> DedupResult {
-        // Level 3: URL dedup
-        if self.seen_urls.contains_key(url) {
-            return DedupResult::UrlDuplicate;
+        // Level 3: URL dedup (with TTL)
+        if let Some(entry) = self.seen_urls.get(url) {
+            if !self.is_url_expired(*entry.value()) {
+                return DedupResult::UrlDuplicate;
+            }
+            // Expired — remove and re-process
+            drop(entry);
+            self.seen_urls.remove(url);
         }
 
         // Level 1: Exact hash
@@ -72,8 +104,8 @@ impl DedupStore {
             }
         }
 
-        // Not a duplicate — register it
-        self.seen_urls.insert(url.to_string(), ());
+        // Not a duplicate — register it with current timestamp
+        self.seen_urls.insert(url.to_string(), Self::now_epoch());
         self.exact_hashes
             .insert(content_hash, url.to_string());
         self.simhash_fps.insert(url.to_string(), fingerprint);
@@ -81,14 +113,17 @@ impl DedupStore {
         DedupResult::Unique
     }
 
-    /// Check URL-only dedup without content.
+    /// Check URL-only dedup without content. Respects TTL.
     pub fn has_url(&self, url: &str) -> bool {
-        self.seen_urls.contains_key(url)
+        match self.seen_urls.get(url) {
+            Some(entry) => !self.is_url_expired(*entry.value()),
+            None => false,
+        }
     }
 
     /// Register a URL as seen (without content check).
     pub fn mark_url_seen(&self, url: &str) {
-        self.seen_urls.insert(url.to_string(), ());
+        self.seen_urls.insert(url.to_string(), Self::now_epoch());
     }
 
     /// Number of unique documents tracked.
@@ -110,7 +145,10 @@ impl DedupStore {
     /// Save dedup state to a JSON file.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         use std::io::Write;
-        let urls: Vec<String> = self.seen_urls.iter().map(|e| e.key().clone()).collect();
+        // Save URLs with timestamps for TTL persistence
+        let urls: Vec<(String, u64)> = self.seen_urls.iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
         let hashes: Vec<(String, String)> = self
             .exact_hashes
             .iter()
@@ -124,7 +162,8 @@ impl DedupStore {
 
         let data = serde_json::json!({
             "threshold": self.simhash_threshold,
-            "urls": urls,
+            "url_ttl_secs": self.url_ttl_secs,
+            "urls_v2": urls,
             "hashes": hashes,
             "fingerprints": fps,
         });
@@ -137,21 +176,37 @@ impl DedupStore {
         Ok(())
     }
 
-    /// Load dedup state from a JSON file.
+    /// Load dedup state from a JSON file. Supports both v1 (no TTL) and v2 (with TTL) formats.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let data = std::fs::read(path)?;
         let parsed: serde_json::Value = serde_json::from_slice(&data)?;
 
         let threshold = parsed["threshold"].as_u64().unwrap_or(3) as u32;
-        let store = DedupStore::new(threshold);
+        let ttl = parsed["url_ttl_secs"].as_u64().unwrap_or(3600);
+        let store = DedupStore::with_ttl(threshold, ttl);
 
-        if let Some(urls) = parsed["urls"].as_array() {
+        // v2 format: urls_v2 = [(url, timestamp), ...]
+        if let Some(urls) = parsed["urls_v2"].as_array() {
+            let now = Self::now_epoch();
+            for u in urls {
+                if let (Some(url), Some(ts)) = (u[0].as_str(), u[1].as_u64()) {
+                    // Skip expired URLs on load
+                    if store.url_ttl_secs > 0 && now.saturating_sub(ts) > store.url_ttl_secs {
+                        continue;
+                    }
+                    store.seen_urls.insert(url.to_string(), ts);
+                }
+            }
+        } else if let Some(urls) = parsed["urls"].as_array() {
+            // v1 legacy format: urls = [url, ...] — assign current timestamp
+            let now = Self::now_epoch();
             for u in urls {
                 if let Some(s) = u.as_str() {
-                    store.seen_urls.insert(s.to_string(), ());
+                    store.seen_urls.insert(s.to_string(), now);
                 }
             }
         }
+
         if let Some(hashes) = parsed["hashes"].as_array() {
             for h in hashes {
                 if let (Some(k), Some(v)) = (h[0].as_str(), h[1].as_str()) {

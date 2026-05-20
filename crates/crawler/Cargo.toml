@@ -28,5 +28,5 @@ regex = "1"
 parking_lot = "0.12"
 moka = { workspace = true }
 
-# Browser support (optional)
-chromiumoxide = { version = "0.7", optional = true }
+# Browser support (optional) — uses tokio runtime, not default async-std
+chromiumoxide = { version = "0.7", optional = true, default-features = false, features = ["tokio-runtime"] }

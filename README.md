@@ -4,17 +4,23 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 
 ## What It Does
 
-- **Crawls the web directly** — no search API keys needed, parses 11 search engines (Google, Bing, Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed)
+- **Crawls the web directly** — no search API keys needed, parses 13 search engines (Google, Bing, Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed, SearXNG metasearch x2)
+- **SearXNG metasearch** — aggregates Google/Bing/DDG results via JSON API without CAPTCHA, bypasses JS-rendering limitations
 - **HTTP response caching** — LRU cache (moka) with 10-minute TTL avoids re-fetching, captures ETag/Last-Modified for conditional requests
-- **Parallel crawling** — concurrent batch fetching with per-domain rate limiting
-- **Extracts clean content** — 2-pass consensus extraction (Readability + Trafilatura-inspired) with CSS/JS sanitization
+- **FuturesUnordered streaming crawler** — processes pages as they arrive (no head-of-line blocking), 8-16 concurrent workers
+- **Headless browser fallback** — optional chromiumoxide integration for JS-rendered pages (SPA detection triggers automatic browser rendering)
+- **Extracts clean content** — parallel 2-pass consensus extraction (Readability + Trafilatura via rayon) with CSS/JS sanitization
+- **Batch embeddings** — two-phase processing: extract+index (no ML), then single batched embed() call for all pages at once
+- **TextRank synthesis** — graph-based extractive summarization using PageRank on sentence cosine-similarity graphs
 - **Language detection** — auto-detects page language from HTML attributes or text analysis (11 languages: en, zh, ja, ko, ar, ru, hi, es, fr, de, pt)
 - **Neural embeddings** — all-MiniLM-L6-v2 via Candle (pure Rust, no Python) for semantic search
 - **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 for token-level relevance scoring
 - **NLI contradiction detection** — nli-deberta-v3-small classifies claim pairs as entailment/contradiction/neutral
 - **5-stage anti-hallucination pipeline** — ISR fusion, cross-encoder rerank, authority scoring, NLI contradiction detection, diversity filtering
-- **Persistent storage** — tantivy index + HNSW vectors (bincode binary format) + dedup state survive across sessions
+- **Persistent storage** — tantivy index + HNSW vectors (bincode binary format) + dedup state with TTL survive across sessions
+- **Dedup with TTL** — URL entries expire after 1 hour (content hashes permanent), enables re-crawl of updated content
 - **Index staleness tracking** — documents stamped with `indexed_at`, search results warn when content is >24h old
+- **Smart frontier** — composite priority scoring: depth + domain authority bonus (Tier1 sites prioritized) + diversity factor
 - **Query reformulation** — 40+ synonym pairs, domain-specific expansion (medical, scientific, news, technical), question variant generation
 - **Enhanced NER** — regex-based extraction of emails, URLs, dates, money, percentages, phone numbers plus capitalized phrase detection
 - **Progress notifications** — broadcast channel reports 5-stage progress during deep_research for MCP-aware clients
@@ -28,19 +34,20 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
                          Progress Notifications
                               |
                          Orchestrator
-                     /    |    |    \
-               Crawler  Extractor  Indexer  Ranker
-                  |        |         |        |
-              Parallel   2-Pass    Tantivy   5-Stage Pipeline
-              HTTP Fetch  Consensus  HNSW     Cross-Encoder Rerank
-              LRU Cache   CSS/JS    SimHash   NLI Contradictions
-              11 Search   Sanitize  Dedup     Authority + Freshness
-              Engines     Snippets  Bincode   MMR Diversity
-              Parser      Metadata  TTL         |
-              Health      Language  Persist   Embedder
-              Sitemap     Chunker     |       MiniLM-L6 (Candle)
-              Robots.txt  NER       Indexed
-              Pagination            At Tracking
+                    /     |     |     \
+              Crawler   Extractor  Indexer    Ranker
+                 |         |         |          |
+           Streaming    Parallel   Tantivy   5-Stage Pipeline
+           Futures      2-Pass     HNSW      Cross-Encoder
+           Unordered    (rayon)    SimHash    NLI Contradictions
+           LRU Cache    CSS/JS     Dedup     Authority+Freshness
+           13 Search    Sanitize   Bincode    MMR Diversity
+           Engines      Language   TTL           |
+           SearXNG      TextRank   Persist    Embedder
+           Browser      NER          |        Batch Embed
+           Fallback     Metadata   Staleness  MiniLM-L6 (Candle)
+           Robots.txt   Chunker    Tracking
+           Pagination
 ```
 
 ### 8 Crates
@@ -48,12 +55,12 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 | Crate | Purpose |
 |-------|---------|
 | `common` | Data models, config, errors, logging |
-| `crawler` | Parallel crawler with LRU response cache, 11 search engine parsers, parser health monitoring, SPA detection, robots.txt, rate limiting, pagination, sitemap |
-| `extractor` | Readability + Trafilatura extraction, CSS/JS sanitization, language detection (11 languages), metadata, JSON-LD, tables, snippet extraction, chunking |
-| `indexer` | Tantivy full-text (disk-backed) + HNSW vectors (bincode binary format) + SimHash/dedup (persistent) + TTL staleness tracking |
-| `embedder` | CandleEmbedder (neural, default) + HashEmbedder (fallback) + CrossEncoder (reranking + NLI) |
+| `crawler` | FuturesUnordered streaming crawler (8-16 workers), LRU response cache, 13 search engine parsers (incl. SearXNG), browser fallback (chromiumoxide), parser health monitoring, SPA detection, robots.txt, rate limiting, pagination, sitemap |
+| `extractor` | Parallel 2-pass extraction (rayon), CSS/JS sanitization, language detection (11 languages), metadata, JSON-LD, tables, snippet extraction, chunking |
+| `indexer` | Tantivy full-text (disk-backed) + HNSW vectors (bincode binary format) + SimHash/dedup with TTL (1-hour URL expiry) + staleness tracking |
+| `embedder` | CandleEmbedder (neural, batch embed) + HashEmbedder (fallback) + CrossEncoder (reranking + NLI) |
 | `ranker` | 5-stage anti-hallucination ranking pipeline with ML models |
-| `orchestrator` | Research flow engine with 40+ synonym query reformulation, domain-specific expansion, enhanced regex NER, progress broadcasting |
+| `orchestrator` | Two-phase batch processing (extract → batch embed), TextRank graph synthesis, 40+ synonym query reformulation, domain-specific expansion, enhanced regex NER, progress broadcasting |
 | `mcp-server` | MCP protocol layer with 13 tool definitions, concurrent tool calls, progress logging |
 
 ## 13 MCP Tools
@@ -160,6 +167,16 @@ cargo build --release
 The binary will be at `target/release/web-search-mcp` (or `web-search-mcp.exe` on Windows).
 
 First run downloads ML models automatically from HuggingFace (~242MB).
+
+### Build with headless browser support
+
+For JS-rendered pages (Google, Bing, SPAs), enable the `browser` feature (requires Chrome/Chromium installed):
+
+```bash
+cargo build --release --features browser
+```
+
+The browser is lazy-initialized — only launches when a page is detected as SPA or a search engine returns 0 results.
 
 ### Minimal build (no ML models)
 
@@ -311,6 +328,14 @@ All search tools return structured JSON with verification metadata:
       "relevance_score": 1.25
     }
   ],
+  "synthesis": [
+    {
+      "text": "Key finding extracted via TextRank graph-based summarization...",
+      "score": 0.1607,
+      "source_url": "https://source.com/article",
+      "source_title": "Article Title"
+    }
+  ],
   "warnings": [
     "NLI model detected semantic contradictions across sources",
     "Limited source diversity: only 2 unique organizations"
@@ -348,7 +373,7 @@ data/
 ├── index/          # Tantivy full-text search index (mmap-backed, with indexed_at timestamps)
 ├── vectors/
 │   └── hnsw.json   # HNSW vector embeddings (384-dim, bincode binary format — auto-migrates from JSON)
-└── dedup.json      # URL seen set + SimHash fingerprints + content hashes
+└── dedup.json      # URL seen set (with TTL timestamps) + SimHash fingerprints + content hashes
 ```
 
 - First search builds the index from scratch
@@ -357,11 +382,13 @@ data/
 - Each document tracks `indexed_at` timestamp — search results report age and warn on stale content (>24h)
 - Vector index uses bincode binary serialization (~5x smaller, faster load/save than JSON)
 - HTTP responses cached in-memory (LRU, 2000 entries, 10-minute TTL) to avoid re-fetching during a session
+- URL dedup entries expire after 1 hour — enables re-crawling updated content on repeat queries
+- Content hash dedup is permanent — identical content is always detected regardless of URL
 - Delete `data/` directory to reset
 
 ## Search Engine Coverage
 
-The crawler parses search result pages from 11 engines and follows actual result links:
+The crawler parses search result pages from 13 engines and follows actual result links:
 
 | Engine | What's Extracted |
 |--------|-----------------|
@@ -369,15 +396,18 @@ The crawler parses search result pages from 11 engines and follows actual result
 | Bing | Result links (`li.b_algo` containers, `h2 a` selectors) |
 | Brave Search | Result links (class `l1`) |
 | Mojeek | Result links (class `title`) |
-| DuckDuckGo | Result links (decoded redirect URLs) |
+| DuckDuckGo | Result links (decoded redirect URLs, 2026 `#links .result` selectors) |
 | Wikipedia | Article links from search results |
 | ArXiv | Paper abstract links (`/abs/`) |
 | Reddit (old) | Comment thread links (`/comments/`) |
 | Hacker News | External links from stories (Algolia JSON API) |
 | Google Scholar | Paper links |
 | PubMed | Article links (numeric IDs, `docsum-title` class) |
+| SearXNG (x2) | **Metasearch JSON API** — aggregates Google/Bing/DDG results without CAPTCHA |
 
-**Parser health monitoring**: If any parser returns 0 results from a content-rich page (>2KB HTML, >10 links), a warning is logged identifying the potentially outdated parser.
+**SearXNG metasearch** is the key innovation for bypassing CAPTCHA/JS-rendering limitations. SearXNG instances aggregate results from major search engines server-side and return clean JSON, giving access to Google/Bing results that would otherwise be blocked by CAPTCHA when crawling directly.
+
+**Parser health monitoring**: If any parser returns 0 results from a content-rich page (>2KB HTML, >10 links), a warning is logged identifying the potentially outdated parser. When a search engine returns 0 results, the crawler automatically retries via headless browser if the `browser` feature is enabled.
 
 ### Query Reformulation
 
@@ -387,7 +417,7 @@ Query expansion generates multiple search variants per query:
 - **Domain-specific expansion** — medical queries add "clinical study", scientific add "research paper", news add current year
 - **Question variants** — short queries get "what is X" variant, question queries get declarative variant
 - **Technical expansion** — tech queries add "documentation" and "tutorial" variants
-- **Up to 6 variants** searched across all 11 engines per variant
+- **Up to 6 variants** searched across all 13 engines per variant
 
 ## Tests
 
@@ -395,9 +425,9 @@ Query expansion generates multiple search variants per query:
 cargo test
 ```
 
-179 tests across all crates:
+187 tests across all crates:
 
-- Search result parsers (Google, Bing, Brave, Mojeek, Wikipedia, ArXiv — 12 tests)
+- Search result parsers (Google, Bing, Brave, Mojeek, Wikipedia, ArXiv, SearXNG — 13 tests)
 - Parser health detection + dedup (3 tests)
 - Content extraction accuracy + CSS sanitization (10 tests)
 - Snippet extraction relevance (4 tests)
@@ -405,7 +435,7 @@ cargo test
 - SimHash near-duplicate detection (3 tests)
 - HNSW vector search (5 tests)
 - Tantivy full-text index with indexed_at timestamps (3 tests)
-- Dedup store (exact + near + URL — 5 tests)
+- Dedup store with TTL (exact + near + URL + expiry — 5 tests)
 - ISR fusion + MMR diversity (4 tests)
 - Query type detection (5 tests)
 - Authority classification + domain-to-org mapping (11 tests)
@@ -419,25 +449,46 @@ cargo test
 - Sitemap XML parsing (3 tests)
 - Cosine similarity + embeddings (10 tests)
 - NER regex extraction (emails, money, dates, percentages — 7 tests)
+- TextRank synthesis (graph scoring, dedup, tokenization, Jaccard — 7 tests)
+- Browser pool initialization (1 test)
 
 ## Project Stats
 
 | Metric | Value |
 |--------|-------|
 | Language | Rust (edition 2024) |
-| Total lines of code | ~17,500 |
+| Total lines of code | ~18,500 |
 | Crates | 8 |
 | MCP tools | 13 (5 smart + 8 atomic) |
-| Search engines | 11 (Google, Bing, Brave, Mojeek, DDG, Wikipedia, ArXiv, Reddit, HN, Scholar, PubMed) |
-| Tests | 179 passing |
+| Search engines | 13 (Google, Bing, Brave, Mojeek, DDG, Wikipedia, ArXiv, Reddit, HN, Scholar, PubMed, SearXNG x2) |
+| Tests | 187 passing |
 | ML models | 3 (auto-downloaded) |
+| Crawler concurrency | 8-16 workers (FuturesUnordered) |
+| Synthesis algorithm | TextRank (PageRank on sentence similarity graph) |
 | Language detection | 11 languages |
 | Synonym pairs | 40+ |
+| Dedup TTL | 1-hour URL expiry, permanent content hashes |
 | Binary size | ~27MB (release) |
-| Ranking pipeline latency | ~77ms |
+| Extraction speed | ~740ms for 50 pages (rayon parallel) |
 | External API dependencies | 0 |
 
 ## Recent Changes
+
+### v0.3.0 — Deep Performance & Algorithm Fixes
+
+Focused on closing the gap with commercial search APIs (speed, relevance, synthesis quality):
+
+- **FuturesUnordered streaming crawler** — replaced batch+semaphore loop with `FuturesUnordered` stream. Pages processed as they arrive, no head-of-line blocking. Concurrency increased from 4 to 8-16 workers. Idle tolerance raised from 0.6s to 5s
+- **Batch embeddings** — two-phase page processing: Phase 1 extracts + indexes all pages (no ML), Phase 2 runs single batched `embed()` call for all texts. Eliminates N sequential `embed_one()` calls
+- **Parallel extraction (rayon)** — Readability + Trafilatura passes now run in parallel via `rayon::join`. Extraction of 50 pages: 3-6s → **740ms** (8x faster)
+- **TextRank graph synthesis** — replaced TF-IDF with TextRank algorithm: builds cosine similarity graph between sentence TF-IDF vectors, runs 30 iterations of PageRank with 0.85 damping, extracts structurally important sentences across all results. Jaccard dedup at 0.5 threshold
+- **SearXNG metasearch** — added 2 SearXNG public instances as search sources. SearXNG aggregates Google/Bing/DDG server-side and returns JSON, bypassing CAPTCHA/JS-rendering limitations. New JSON parser for SearXNG response format
+- **Headless browser module** — new `browser.rs` with chromiumoxide `BrowserPool`. Feature-gated (`--features browser`), lazy-init on first SPA detection. Fetcher auto-retries via browser when SPA detected. Crawler retries search engines via browser when parser returns 0
+- **Smart frontier priority** — composite scoring: depth + domain authority bonus (0.3 for .gov/.edu, 0.2 for Wikipedia/GitHub, 0.1 for Reddit/Medium) + domain diversity factor. Higher-quality pages crawled first
+- **Dedup TTL** — URL entries now expire after 1 hour (configurable). Content hash dedup permanent. v2 JSON format with timestamps, auto-migrates v1. Repeat queries get fresh results
+- **Relaxed content filter** — word threshold 30→15, CAPTCHA detection requires 2+ block phrases or <100 words (was: 1 phrase + <200 words). Body minimum 50→30 chars. Fewer false rejections
+- **DuckDuckGo parser update** — added 2026 CSS selectors (`#links .result`, `.result__body`, `.result__snippet`)
+- **SearchResponse synthesis field** — new `SynthesizedSentence` type with text, score, source_url, source_title. Populated by TextRank after ranking
 
 ### v0.2.0 — Gap Fixes
 

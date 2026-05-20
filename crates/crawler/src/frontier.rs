@@ -72,6 +72,42 @@ impl UrlFrontier {
         }
     }
 
+    /// Add a URL with optional anchor text and query for relevance scoring.
+    pub fn push_with_context(&self, url: &str, depth: u8, anchor_text: &str, query: &str) -> bool {
+        let normalized = normalize_url(url);
+        if self.seen.contains_key(&normalized) {
+            return false;
+        }
+        let domain = extract_domain(&normalized);
+        let count = self.domain_counts.get(&domain).map(|v| *v).unwrap_or(0);
+        if count >= self.max_per_domain {
+            return false;
+        }
+
+        // Composite priority: depth + authority + diversity + URL relevance prediction
+        let depth_score = 1.0 / (depth as f32 + 1.0);
+        let authority = domain_authority_bonus(&domain);
+        let diversity = 1.0 / (count as f32 + 1.0);
+
+        // URL relevance prediction: score URL without fetching the page.
+        // Uses anchor text overlap with query + URL path token matching.
+        let url_relevance = predict_url_relevance(url, anchor_text, query);
+
+        let priority = depth_score + authority + diversity * 0.2 + url_relevance * 0.4;
+
+        self.seen.insert(normalized.clone(), ());
+        *self.domain_counts.entry(domain.clone()).or_insert(0) += 1;
+
+        let mut queue = self.queue.lock();
+        queue.push(PrioritizedUrl {
+            url: normalized,
+            domain,
+            depth,
+            priority,
+        });
+        true
+    }
+
     /// Add a URL to the frontier. Returns false if already seen or domain limit reached.
     pub fn push(&self, url: &str, depth: u8) -> bool {
         // Normalize URL
@@ -146,6 +182,58 @@ impl UrlFrontier {
             self.push(url, 0);
         }
     }
+}
+
+/// Predict URL relevance to a query without fetching the page.
+///
+/// Algorithm (from "Fast Webpage Classification Using URL Features"):
+/// 1. Tokenize URL path into words (split on /-_.)
+/// 2. Tokenize anchor text into words
+/// 3. Tokenize query into words
+/// 4. Score = |anchor ∩ query| / |query| + |url_path ∩ query| / |query| * 0.5
+///
+/// This gives a [0.0, 1.5] relevance prediction score.
+/// No network I/O required — pure string analysis.
+fn predict_url_relevance(url: &str, anchor_text: &str, query: &str) -> f32 {
+    if query.is_empty() {
+        return 0.0;
+    }
+
+    let query_words: std::collections::HashSet<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect();
+
+    if query_words.is_empty() {
+        return 0.0;
+    }
+
+    // Score anchor text overlap with query (strongest signal)
+    let anchor_words: std::collections::HashSet<String> = anchor_text
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect();
+    let anchor_overlap = query_words.intersection(&anchor_words).count() as f32;
+    let anchor_score = anchor_overlap / query_words.len() as f32;
+
+    // Score URL path token overlap with query (weaker signal)
+    let url_path = url::Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_default();
+    let path_words: std::collections::HashSet<String> = url_path
+        .to_lowercase()
+        .split(|c: char| c == '/' || c == '-' || c == '_' || c == '.')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_string())
+        .collect();
+    let path_overlap = query_words.intersection(&path_words).count() as f32;
+    let path_score = path_overlap / query_words.len() as f32;
+
+    anchor_score + path_score * 0.5
 }
 
 /// Normalize URL: lowercase scheme+host, remove fragment, trailing slash.

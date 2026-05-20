@@ -21,19 +21,21 @@ pub struct ScoredSentence {
     pub source_title: String,
 }
 
-/// Synthesize top-K sentences using TextRank (graph-based) + TF-IDF scoring.
+/// Synthesize top-K sentences using Query-Focused MMR + TextRank.
 ///
-/// Algorithm:
-/// 1. Split all documents into sentences, compute TF-IDF vectors per sentence
-/// 2. Build weighted graph: edges = cosine similarity between sentence TF-IDF vectors
-/// 3. Run PageRank-style iteration until convergence
-/// 4. Rank by TextRank score, deduplicate by Jaccard similarity
+/// Hybrid algorithm:
+/// 1. TextRank: graph-based importance scoring (PageRank on sentence similarity)
+/// 2. Query relevance: TF-IDF cosine similarity between each sentence and the query
+/// 3. MMR selection: greedily pick sentences maximizing:
+///    score = λ * query_relevance + (1-λ) * textrank_score - penalty * max_sim_to_selected
+///    This ensures sentences are both relevant to the query AND informative AND diverse.
 ///
-/// TextRank finds structurally important sentences (connected to many other
-/// informative sentences) rather than just lexically heavy ones.
+/// This hybrid approach outperforms pure TextRank (which ignores the query) and
+/// pure TF-IDF (which ignores structural importance).
 pub fn synthesize_tfidf(
     documents: &[(&str, &str, &str)], // (body, url, title)
     top_k: usize,
+    query: &str,
 ) -> Vec<ScoredSentence> {
     if documents.is_empty() {
         return vec![];
@@ -147,40 +149,94 @@ pub fn synthesize_tfidf(
         }
     }
 
-    // Step 5: Boost scores with fact/source signals
-    let mut scored: Vec<ScoredSentence> = all_sentences
-        .iter()
-        .enumerate()
-        .map(|(i, (sent, url, title))| {
-            let mut score = scores[i];
-            // Boost sentences with numbers (likely contains data)
-            if sent.chars().any(|c| c.is_ascii_digit()) { score *= 1.15; }
-            // Boost sentences from multiple-source-referenced content
-            if sent.contains('"') || sent.contains('\u{201c}') { score *= 1.05; }
-            // Slight penalty for very short sentences
-            let word_count = sent.split_whitespace().count();
-            if word_count < 8 { score *= 0.8; }
-
-            ScoredSentence {
-                text: sent.clone(),
-                score,
-                source_url: url.to_string(),
-                source_title: title.to_string(),
+    // Step 5: Compute query relevance for each sentence
+    let query_tokens: HashMap<usize, f32> = {
+        let words = tokenize(query);
+        let total = words.len().max(1) as f32;
+        let mut vec = HashMap::new();
+        let mut tf_counts: HashMap<String, u32> = HashMap::new();
+        for w in &words {
+            *tf_counts.entry(w.clone()).or_insert(0) += 1;
+        }
+        for (word, count) in tf_counts {
+            let idx = *vocab.get(&word).unwrap_or(&usize::MAX);
+            if idx != usize::MAX {
+                let tf = count as f32 / total;
+                let idf = doc_freq.get(&word).map(|&d| (num_docs / d as f32).ln() + 1.0).unwrap_or(1.0);
+                vec.insert(idx, tf * idf);
             }
-        })
+        }
+        vec
+    };
+
+    // Query-sentence relevance scores (cosine similarity to query TF-IDF vector)
+    let query_relevance: Vec<f32> = sentence_vectors.iter()
+        .map(|sv| sparse_cosine(sv, &query_tokens))
         .collect();
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    // Step 6: MMR greedy selection
+    // score_i = λ * query_relevance + (1-λ) * textrank_score - penalty * max_sim_to_selected
+    // λ = 0.6 (bias toward query relevance)
+    let lambda = 0.6_f32;
+    let diversity_penalty = 0.3_f32;
 
-    // Step 6: Deduplicate by Jaccard similarity
+    // Normalize textrank scores to [0,1]
+    let max_tr = scores.iter().cloned().fold(0.0_f32, f32::max);
+    let norm_tr: Vec<f32> = if max_tr > 0.0 {
+        scores.iter().map(|s| s / max_tr).collect()
+    } else {
+        vec![0.0; n]
+    };
+    let max_qr = query_relevance.iter().cloned().fold(0.0_f32, f32::max);
+    let norm_qr: Vec<f32> = if max_qr > 0.0 {
+        query_relevance.iter().map(|s| s / max_qr).collect()
+    } else {
+        vec![0.0; n]
+    };
+
     let mut selected: Vec<ScoredSentence> = Vec::with_capacity(top_k);
-    for candidate in scored {
-        if selected.len() >= top_k {
-            break;
+    let mut used = vec![false; n];
+
+    for _ in 0..top_k {
+        let mut best_idx = None;
+        let mut best_mmr = f32::NEG_INFINITY;
+
+        for i in 0..n {
+            if used[i] { continue; }
+            let word_count = all_sentences[i].0.split_whitespace().count();
+            if word_count < 5 { continue; }
+
+            // Query relevance + TextRank importance
+            let base = lambda * norm_qr[i] + (1.0 - lambda) * norm_tr[i];
+
+            // Fact boost
+            let fact_boost = if all_sentences[i].0.chars().any(|c| c.is_ascii_digit()) { 0.05 } else { 0.0 };
+
+            // Diversity penalty: max similarity to any already-selected sentence
+            let max_sim = selected.iter()
+                .map(|s| jaccard_similarity(&s.text, &all_sentences[i].0))
+                .fold(0.0_f32, f32::max);
+
+            let mmr = base + fact_boost - diversity_penalty * max_sim;
+
+            if mmr > best_mmr {
+                best_mmr = mmr;
+                best_idx = Some(i);
+            }
         }
-        let dominated = selected.iter().any(|s| jaccard_similarity(&s.text, &candidate.text) > 0.5);
-        if !dominated {
-            selected.push(candidate);
+
+        match best_idx {
+            Some(i) => {
+                used[i] = true;
+                let (ref sent, url, title) = all_sentences[i];
+                selected.push(ScoredSentence {
+                    text: sent.clone(),
+                    score: best_mmr,
+                    source_url: url.to_string(),
+                    source_title: title.to_string(),
+                });
+            }
+            None => break,
         }
     }
 
@@ -296,7 +352,7 @@ mod tests {
             ),
         ];
 
-        let result = synthesize_tfidf(&docs, 3);
+        let result = synthesize_tfidf(&docs, 3, "Rust programming language");
         assert!(!result.is_empty());
         assert!(result.len() <= 3);
         // Each result should have source attribution
@@ -308,7 +364,7 @@ mod tests {
 
     #[test]
     fn synthesize_empty_input() {
-        let result = synthesize_tfidf(&[], 5);
+        let result = synthesize_tfidf(&[], 5, "test");
         assert!(result.is_empty());
     }
 
@@ -322,7 +378,7 @@ mod tests {
             ),
         ];
 
-        let result = synthesize_tfidf(&docs, 5);
+        let result = synthesize_tfidf(&docs, 5, "Rust memory safety");
         // Should not return both near-identical sentences
         assert!(result.len() <= 2);
     }

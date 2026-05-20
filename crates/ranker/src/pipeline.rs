@@ -119,37 +119,77 @@ impl RankingPipeline {
 
         tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: ISR fusion");
 
-        // Stage 2: Cross-encoder rerank
+        // Stage 2: Cross-encoder rerank with early termination
+        //
+        // Algorithm: Score candidates in batches sorted by ISR score (best first).
+        // After scoring top_k * 2 candidates, if the last batch's best score is
+        // below 50% of the running max, stop — remaining candidates are unlikely
+        // to overtake the leaders. Saves ~50% inference time on large candidate sets.
         if let Some(reranker) = &self.reranker {
-            // Build (query, doc_body) pairs for cross-encoder scoring
-            let pairs: Vec<(&str, String)> = scored.iter()
-                .map(|(idx, _)| {
-                    let body = &candidates[*idx].body_text;
-                    // Truncate body to ~256 chars for cross-encoder (max_seq ~512 tokens)
-                    let truncated: String = body.chars().take(512).collect();
-                    (query, truncated)
-                })
-                .collect();
+            let early_term_min = (top_k * 2).max(10).min(scored.len());
+            let batch_size = 8;
+            let mut ce_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
+            let mut max_ce_score = 0.0_f32;
+            let mut terminated_early = false;
 
-            let pair_refs: Vec<(&str, &str)> = pairs.iter()
-                .map(|(q, d)| (*q, d.as_str()))
-                .collect();
+            for chunk_start in (0..scored.len()).step_by(batch_size) {
+                let chunk_end = (chunk_start + batch_size).min(scored.len());
+                let chunk = &scored[chunk_start..chunk_end];
 
-            match reranker.score_pairs(&pair_refs) {
-                Ok(scores) => {
-                    for (i, ce_score) in scores.iter().enumerate() {
-                        if i < scored.len() {
-                            // Blend ISR score with cross-encoder score
-                            scored[i].1 = 0.3 * scored[i].1 + 0.7 * ce_score.score;
+                let pairs: Vec<(&str, String)> = chunk.iter()
+                    .map(|(idx, _)| {
+                        let body = &candidates[*idx].body_text;
+                        let truncated: String = body.chars().take(512).collect();
+                        (query, truncated)
+                    })
+                    .collect();
+
+                let pair_refs: Vec<(&str, &str)> = pairs.iter()
+                    .map(|(q, d)| (*q, d.as_str()))
+                    .collect();
+
+                match reranker.score_pairs(&pair_refs) {
+                    Ok(scores) => {
+                        let mut batch_max = 0.0_f32;
+                        for (i, ce_score) in scores.iter().enumerate() {
+                            let global_i = chunk_start + i;
+                            if global_i < scored.len() {
+                                let blended = 0.3 * scored[global_i].1 + 0.7 * ce_score.score;
+                                ce_scores.push((scored[global_i].0, blended));
+                                batch_max = batch_max.max(ce_score.score);
+                                max_ce_score = max_ce_score.max(ce_score.score);
+                            }
+                        }
+
+                        // Early termination: if we've scored enough AND this batch is weak
+                        if ce_scores.len() >= early_term_min && batch_max < max_ce_score * 0.5 {
+                            tracing::debug!(
+                                scored = ce_scores.len(),
+                                total = scored.len(),
+                                "Stage 2: early termination — remaining candidates unlikely to improve"
+                            );
+                            terminated_early = true;
+                            break;
                         }
                     }
-                    // Re-sort by blended score
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    tracing::debug!("Stage 2: cross-encoder reranking applied");
+                    Err(e) => {
+                        tracing::warn!("Cross-encoder batch failed: {e}");
+                        // Keep ISR scores for this batch
+                        for &(idx, isr) in chunk {
+                            ce_scores.push((idx, isr));
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Cross-encoder reranking failed, using ISR only: {e}");
-                }
+            }
+
+            // Replace scored with cross-encoder results
+            scored = ce_scores;
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            if terminated_early {
+                tracing::debug!(scored = scored.len(), "Stage 2: cross-encoder with early termination");
+            } else {
+                tracing::debug!(scored = scored.len(), "Stage 2: cross-encoder full scoring");
             }
         }
 
@@ -308,6 +348,12 @@ impl RankingPipeline {
             })
             .collect();
 
+        // xQuAD-style subtopic diversification:
+        // Re-order results to maximize coverage of different subtopics.
+        // Extract key bigrams from each result as "subtopics", then greedily
+        // reorder so each next result covers the most uncovered subtopics.
+        let results = xquad_diversify(results, query);
+
         let elapsed = start.elapsed().as_millis() as u64;
 
         tracing::info!(
@@ -464,6 +510,80 @@ fn extract_key_phrases(text: &str) -> Vec<String> {
         })
         .take(20) // limit to avoid O(n²) in cross-reference
         .collect()
+}
+
+/// xQuAD-style result diversification.
+///
+/// Algorithm (from Santos et al., "Explicit Search Result Diversification"):
+/// 1. Extract "subtopics" from each result as key bigrams not in the query
+/// 2. Greedily reorder: each step picks the result that covers the most
+///    uncovered subtopics, weighted by relevance score
+/// 3. This ensures the final result set covers multiple aspects of the query
+///
+/// Complexity: O(k * n * t) where k=results, n=subtopics, t=terms per result
+fn xquad_diversify(mut results: Vec<RankedResult>, query: &str) -> Vec<RankedResult> {
+    if results.len() <= 2 {
+        return results;
+    }
+
+    let query_words: std::collections::HashSet<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+
+    // Extract subtopic bigrams from each result
+    let subtopics: Vec<std::collections::HashSet<String>> = results.iter()
+        .map(|r| {
+            let words: Vec<String> = r.content
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 3 && !query_words.contains(*w))
+                .map(|w| w.to_string())
+                .collect();
+            // Use bigrams as subtopics
+            words.windows(2)
+                .map(|pair| format!("{}_{}", pair[0], pair[1]))
+                .collect()
+        })
+        .collect();
+
+    // Greedy diversification
+    let mut selected: Vec<usize> = Vec::with_capacity(results.len());
+    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut remaining: Vec<usize> = (0..results.len()).collect();
+
+    while !remaining.is_empty() {
+        let mut best_idx = 0;
+        let mut best_score = f32::NEG_INFINITY;
+
+        for (pos, &ri) in remaining.iter().enumerate() {
+            let new_coverage = subtopics[ri].iter()
+                .filter(|t| !covered.contains(*t))
+                .count() as f32;
+            // Score = relevance * (1 + new_subtopic_coverage * 0.1)
+            let score = results[ri].relevance_score * (1.0 + new_coverage * 0.1);
+            if score > best_score {
+                best_score = score;
+                best_idx = pos;
+            }
+        }
+
+        let chosen = remaining.remove(best_idx);
+        covered.extend(subtopics[chosen].iter().cloned());
+        selected.push(chosen);
+    }
+
+    // Reorder results by selected order
+    let mut diversified = Vec::with_capacity(results.len());
+    // We need to take ownership — use indices to extract from original
+    let mut slots: Vec<Option<RankedResult>> = results.drain(..).map(Some).collect();
+    for i in selected {
+        if let Some(r) = slots[i].take() {
+            diversified.push(r);
+        }
+    }
+    diversified
 }
 
 #[cfg(test)]

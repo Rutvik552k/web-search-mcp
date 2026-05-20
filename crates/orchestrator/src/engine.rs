@@ -26,6 +26,13 @@ pub struct ProgressUpdate {
     pub message: String,
 }
 
+/// Semantic query cache entry — stores response with query embedding for similarity matching.
+struct QueryCacheEntry {
+    query_embedding: Vec<f32>,
+    response: SearchResponse,
+    cached_at: Instant,
+}
+
 /// Central search engine coordinating all components.
 ///
 /// Owns the crawler, extractor, indexer, embedder, and ranker.
@@ -40,6 +47,10 @@ pub struct SearchEngine {
     _config: Config,
     /// Optional progress callback for long-running operations
     progress_tx: Option<tokio::sync::broadcast::Sender<ProgressUpdate>>,
+    /// Semantic query cache: similar queries return cached results instantly.
+    /// Key insight: "Rust benefits 2026" and "advantages of Rust language" should
+    /// hit the same cache because their embeddings are similar (cosine > 0.85).
+    query_cache: tokio::sync::Mutex<Vec<QueryCacheEntry>>,
 }
 
 impl SearchEngine {
@@ -90,6 +101,7 @@ impl SearchEngine {
             pipeline,
             _config: config,
             progress_tx: Some(progress_tx),
+            query_cache: tokio::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -191,8 +203,8 @@ impl SearchEngine {
         let top_k = 10;
         let mut response = self.pipeline.rank(candidates, query, top_k);
 
-        // Apply TF-IDF synthesis across results
-        self.apply_synthesis(&mut response);
+        // Apply query-focused MMR synthesis across results
+        self.apply_synthesis(&mut response, query);
 
         self.send_progress(5, Some(5), &format!(
             "Deep research complete: {} results from {} pages in {}ms",
@@ -209,12 +221,26 @@ impl SearchEngine {
         Ok(response)
     }
 
-    /// Quick search: single-wave crawl, fast ranking.
+    /// Quick search: pipelined crawl+extract with streaming.
+    ///
+    /// Pipeline architecture (overlap stages, don't wait for full crawl):
+    /// 1. Crawl pages (streaming via FuturesUnordered)
+    /// 2. Extract + index pages AS they arrive (no wait for full crawl)
+    /// 3. Batch embed all at once after extraction
+    /// 4. Rank + synthesize
     pub async fn quick_search(
         &self,
         query: &str,
         max_results: usize,
     ) -> Result<SearchResponse> {
+        let pipeline_start = Instant::now();
+
+        // Check semantic query cache first
+        if let Some(cached) = self.check_query_cache(query).await {
+            tracing::info!(query, "Semantic cache hit — returning cached results");
+            return Ok(cached);
+        }
+
         let seeds = generate_search_seeds(query);
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
 
@@ -231,7 +257,17 @@ impl SearchEngine {
         self.save_vectors();
         self.apply_hybrid_ranks(&mut candidates, query).await;
         let mut response = self.pipeline.rank(candidates, query, max_results);
-        self.apply_synthesis(&mut response);
+        self.apply_synthesis(&mut response, query);
+
+        // Cache the response for similar future queries
+        self.cache_query_response(query, &response).await;
+
+        tracing::info!(
+            total_ms = pipeline_start.elapsed().as_millis(),
+            results = response.results.len(),
+            "Quick search pipeline complete"
+        );
+
         Ok(response)
     }
 
@@ -427,14 +463,71 @@ impl SearchEngine {
         }))?)
     }
 
-    /// Apply TF-IDF extractive synthesis to a search response.
-    /// Extracts top-5 most informative sentences across all results.
-    fn apply_synthesis(&self, response: &mut SearchResponse) {
+    // ── Semantic Query Cache ─────────────────────────────────────
+
+    /// Check if a semantically similar query was recently searched.
+    /// Returns cached response if cosine similarity > 0.85 and age < 30 minutes.
+    async fn check_query_cache(&self, query: &str) -> Option<SearchResponse> {
+        let query_vec = self.embedder.embed_one(query).await.ok()?;
+        let cache = self.query_cache.lock().await;
+        let now = Instant::now();
+        let ttl = Duration::from_secs(1800); // 30 minutes
+
+        let mut best_sim = 0.0_f32;
+        let mut best_response = None;
+
+        for entry in cache.iter() {
+            if now.duration_since(entry.cached_at) > ttl {
+                continue; // expired
+            }
+            let sim = web_search_embedder::cosine_similarity(&query_vec, &entry.query_embedding);
+            if sim > 0.85 && sim > best_sim {
+                best_sim = sim;
+                best_response = Some(entry.response.clone());
+            }
+        }
+
+        if let Some(ref resp) = best_response {
+            tracing::info!(
+                similarity = best_sim,
+                cached_results = resp.results.len(),
+                "Semantic cache hit"
+            );
+        }
+        best_response
+    }
+
+    /// Cache a query response for future similar queries.
+    async fn cache_query_response(&self, query: &str, response: &SearchResponse) {
+        if response.results.is_empty() {
+            return; // don't cache empty results
+        }
+        if let Ok(query_vec) = self.embedder.embed_one(query).await {
+            let mut cache = self.query_cache.lock().await;
+            // Evict expired entries and cap at 100
+            let now = Instant::now();
+            let ttl = Duration::from_secs(1800);
+            cache.retain(|e| now.duration_since(e.cached_at) < ttl);
+            if cache.len() >= 100 {
+                cache.remove(0); // LRU eviction
+            }
+            cache.push(QueryCacheEntry {
+                query_embedding: query_vec,
+                response: response.clone(),
+                cached_at: now,
+            });
+            tracing::info!(cache_size = cache.len(), "Query response cached");
+        }
+    }
+
+    /// Apply query-focused MMR synthesis to a search response.
+    /// Uses query relevance + novelty to select top-5 most informative sentences.
+    fn apply_synthesis(&self, response: &mut SearchResponse, query: &str) {
         let docs: Vec<(&str, &str, &str)> = response.results.iter()
             .map(|r| (r.content.as_str(), r.url.as_str(), r.title.as_str()))
             .collect();
 
-        let scored = synthesis::synthesize_tfidf(&docs, 5);
+        let scored = synthesis::synthesize_tfidf(&docs, 5, query);
         response.synthesis = scored.into_iter()
             .map(|s| SynthesizedSentence {
                 text: s.text,

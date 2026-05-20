@@ -26,6 +26,7 @@ scraper = "0.21"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 parking_lot = "0.12"
+moka = { workspace = true }
 
 # Browser support (optional)
 chromiumoxide = { version = "0.7", optional = true }

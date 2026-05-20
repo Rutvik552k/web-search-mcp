@@ -161,23 +161,59 @@ fn get_str_array(
         .ok_or_else(|| format!("Missing required array parameter: {key}").into())
 }
 
-/// Basic entity extraction (placeholder for full NER).
+/// Enhanced entity extraction using regex patterns + capitalized phrase detection.
 ///
-/// Finds capitalized multi-word phrases that likely represent
-/// named entities (persons, organizations, locations).
+/// Extracts: emails, URLs, dates, money amounts, percentages, phone numbers,
+/// plus capitalized multi-word phrases (persons, organizations, locations).
 fn extract_basic_entities(text: &str) -> Vec<serde_json::Value> {
-    let mut entities = Vec::new();
-    let words: Vec<&str> = text.split_whitespace().collect();
+    use regex::Regex;
 
+    let mut entities = Vec::new();
+
+    // Regex-based extraction for structured entities
+    let patterns: &[(&str, &str)] = &[
+        // Email addresses
+        (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "email"),
+        // URLs
+        (r#"https?://[^\s<>"']+"#, "url"),
+        // Dates: "January 15, 2025", "2025-01-15", "01/15/2025", "15 Jan 2025"
+        (r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b", "date"),
+        (r"\b\d{4}-\d{2}-\d{2}\b", "date"),
+        (r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "date"),
+        (r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b", "date"),
+        // Money: "$1,234.56", "€500", "£12.5M"
+        (r"[$€£¥]\s?\d[\d,]*\.?\d*\s?[BMKbmk]?\b", "money"),
+        (r"\b\d[\d,]*\.?\d*\s?(?:dollars|euros|pounds|USD|EUR|GBP)\b", "money"),
+        // Percentages: "45.6%", "12 percent"
+        (r"\b\d+\.?\d*\s?%", "percentage"),
+        (r"\b\d+\.?\d*\s+percent\b", "percentage"),
+        // Phone numbers: "+1-555-123-4567", "(555) 123-4567"
+        (r"\+?\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "phone"),
+    ];
+
+    for &(pattern, entity_type) in patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            for m in re.find_iter(text) {
+                let name = m.as_str().trim().to_string();
+                if name.len() >= 3 {
+                    entities.push(serde_json::json!({
+                        "name": name,
+                        "type": entity_type,
+                    }));
+                }
+            }
+        }
+    }
+
+    // Capitalized phrase extraction (names, orgs, locations)
+    let words: Vec<&str> = text.split_whitespace().collect();
     let mut i = 0;
     while i < words.len() {
-        // Look for sequences of capitalized words
         if words[i].chars().next().map_or(false, |c| c.is_uppercase()) {
             let mut end = i + 1;
             while end < words.len() {
                 let word = words[end];
                 let first_char = word.chars().next().unwrap_or(' ');
-                // Continue if capitalized or connecting word (of, the, and)
                 if first_char.is_uppercase()
                     || matches!(word, "of" | "the" | "and" | "for" | "in" | "de" | "van" | "von")
                 {
@@ -189,7 +225,6 @@ fn extract_basic_entities(text: &str) -> Vec<serde_json::Value> {
 
             if end > i + 1 || words[i].len() > 1 {
                 let entity_text = words[i..end].join(" ");
-                // Filter out common sentence starters
                 let skip = matches!(
                     entity_text.as_str(),
                     "The" | "This" | "That" | "These" | "Those"
@@ -206,7 +241,6 @@ fn extract_basic_entities(text: &str) -> Vec<serde_json::Value> {
                     }));
                 }
             }
-
             i = end;
         } else {
             i += 1;
@@ -236,6 +270,8 @@ fn guess_entity_type(entity: &str) -> &'static str {
         || lower.contains("corporation") || lower.contains("company")
         || lower.contains("inc") || lower.contains("ltd") || lower.contains("llc")
         || lower.contains("association") || lower.contains("foundation")
+        || lower.contains("agency") || lower.contains("department")
+        || lower.contains("ministry") || lower.contains("committee")
     {
         return "organization";
     }
@@ -247,6 +283,13 @@ fn guess_entity_type(entity: &str) -> &'static str {
         || lower.contains("october") || lower.contains("november") || lower.contains("december")
     {
         return "date";
+    }
+
+    // Product signals
+    if lower.contains("version") || lower.contains("v1") || lower.contains("v2")
+        || lower.contains("pro") || lower.contains("plus") || lower.contains("edition")
+    {
+        return "product";
     }
 
     // Default: treat multi-word capitalized as person or unknown
@@ -271,6 +314,53 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n.contains("Einstein")));
         assert!(names.iter().any(|n| n.contains("Princeton")));
+    }
+
+    #[test]
+    fn extract_entities_finds_emails() {
+        let entities = extract_basic_entities(
+            "Contact us at hello@example.com for more info."
+        );
+        let types: Vec<&str> = entities.iter()
+            .filter_map(|e| e["type"].as_str())
+            .collect();
+        assert!(types.contains(&"email"));
+    }
+
+    #[test]
+    fn extract_entities_finds_money() {
+        let entities = extract_basic_entities(
+            "The project costs $1,234.56 and was funded with €500."
+        );
+        let money: Vec<&str> = entities.iter()
+            .filter(|e| e["type"].as_str() == Some("money"))
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(money.iter().any(|m| m.contains("1,234")));
+        assert!(money.iter().any(|m| m.contains("500")));
+    }
+
+    #[test]
+    fn extract_entities_finds_dates() {
+        let entities = extract_basic_entities(
+            "The event on January 15, 2025 and another on 2025-03-20."
+        );
+        let dates: Vec<&str> = entities.iter()
+            .filter(|e| e["type"].as_str() == Some("date"))
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(dates.iter().any(|d| d.contains("January")));
+        assert!(dates.iter().any(|d| d.contains("2025-03-20")));
+    }
+
+    #[test]
+    fn extract_entities_finds_percentages() {
+        let entities = extract_basic_entities("Growth was 45.6% year-over-year.");
+        let pcts: Vec<&str> = entities.iter()
+            .filter(|e| e["type"].as_str() == Some("percentage"))
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert!(pcts.iter().any(|p| p.contains("45.6")));
     }
 
     #[test]

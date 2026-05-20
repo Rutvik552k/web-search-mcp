@@ -139,9 +139,9 @@ mod tests {
     #[test]
     fn isr_fuse_ranks_consensus_higher() {
         let bm25 = vec![
-            TextSearchResult { doc_id: 0, url: "a.com".into(), title: "A".into(), domain: "a.com".into(), score: 5.0, source_tier: 4 },
-            TextSearchResult { doc_id: 1, url: "b.com".into(), title: "B".into(), domain: "b.com".into(), score: 4.0, source_tier: 4 },
-            TextSearchResult { doc_id: 2, url: "c.com".into(), title: "C".into(), domain: "c.com".into(), score: 3.0, source_tier: 4 },
+            TextSearchResult { doc_id: 0, url: "a.com".into(), title: "A".into(), domain: "a.com".into(), score: 5.0, source_tier: 4, indexed_at: 0 },
+            TextSearchResult { doc_id: 1, url: "b.com".into(), title: "B".into(), domain: "b.com".into(), score: 4.0, source_tier: 4, indexed_at: 0 },
+            TextSearchResult { doc_id: 2, url: "c.com".into(), title: "C".into(), domain: "c.com".into(), score: 3.0, source_tier: 4, indexed_at: 0 },
         ];
         let vector = vec![
             VectorSearchResult { doc_id: "b.com".into(), score: 0.95 },
@@ -172,6 +172,7 @@ mod tests {
             domain: "test.com".into(),
             score: 10.0,
             source_tier: 2,
+            indexed_at: 0,
         }];
         let vector = vec![];
 

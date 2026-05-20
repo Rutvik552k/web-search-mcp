@@ -129,6 +129,109 @@ fn extract_language(doc: &Html) -> Option<String> {
         }
     }
 
+    // Fallback: detect language from visible text using character analysis
+    let body_sel = Selector::parse("body").unwrap();
+    if let Some(body) = doc.select(&body_sel).next() {
+        let text = body.text().collect::<String>();
+        if text.len() > 100 {
+            return detect_language_from_text(&text);
+        }
+    }
+
+    None
+}
+
+/// Lightweight language detection from text using character frequency and common words.
+///
+/// Covers: English, Chinese, Japanese, Korean, Arabic, Russian, Hindi, Spanish,
+/// French, German, Portuguese. Returns ISO 639-1 code.
+fn detect_language_from_text(text: &str) -> Option<String> {
+    let mut cjk = 0u32;
+    let mut arabic = 0u32;
+    let mut cyrillic = 0u32;
+    let mut devanagari = 0u32;
+    let mut hangul = 0u32;
+    let mut hiragana_katakana = 0u32;
+    let mut latin = 0u32;
+    let mut total = 0u32;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            continue;
+        }
+        total += 1;
+        match ch {
+            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' => cjk += 1,
+            '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' => arabic += 1,
+            '\u{0400}'..='\u{04FF}' => cyrillic += 1,
+            '\u{0900}'..='\u{097F}' => devanagari += 1,
+            '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' => hangul += 1,
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => hiragana_katakana += 1,
+            'A'..='Z' | 'a'..='z' | '\u{00C0}'..='\u{024F}' => latin += 1,
+            _ => {}
+        }
+    }
+
+    if total < 50 {
+        return None;
+    }
+
+    let threshold = total / 4;
+
+    // Non-Latin scripts are easy to identify
+    if cjk > threshold && hiragana_katakana > 0 {
+        return Some("ja".to_string()); // Japanese: CJK + kana
+    }
+    if cjk > threshold {
+        return Some("zh".to_string()); // Chinese
+    }
+    if hangul > threshold {
+        return Some("ko".to_string()); // Korean
+    }
+    if arabic > threshold {
+        return Some("ar".to_string()); // Arabic
+    }
+    if cyrillic > threshold {
+        return Some("ru".to_string()); // Russian (could be Ukrainian/Bulgarian)
+    }
+    if devanagari > threshold {
+        return Some("hi".to_string()); // Hindi
+    }
+
+    // Latin-script languages: use common word detection
+    if latin > threshold {
+        let lower = text.to_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
+
+        // Count language-specific stopwords
+        let en_words = ["the", "is", "are", "was", "were", "and", "that", "this", "with", "have", "for", "not", "but", "from"];
+        let es_words = ["que", "los", "las", "una", "con", "para", "por", "como", "más", "pero", "del", "esta"];
+        let fr_words = ["les", "des", "une", "que", "est", "pas", "dans", "pour", "sur", "avec", "plus", "cette"];
+        let de_words = ["der", "die", "das", "und", "ist", "ein", "eine", "nicht", "mit", "auf", "den", "auch"];
+        let pt_words = ["que", "não", "para", "uma", "com", "dos", "das", "mais", "como", "esta", "pela"];
+
+        let count = |stopwords: &[&str]| -> usize {
+            words.iter().filter(|w| stopwords.contains(w)).count()
+        };
+
+        let en = count(&en_words);
+        let es = count(&es_words);
+        let fr = count(&fr_words);
+        let de = count(&de_words);
+        let pt = count(&pt_words);
+
+        let max = en.max(es).max(fr).max(de).max(pt);
+        if max < 3 {
+            return Some("en".to_string()); // default for Latin text
+        }
+
+        if en == max { return Some("en".to_string()); }
+        if es == max { return Some("es".to_string()); }
+        if fr == max { return Some("fr".to_string()); }
+        if de == max { return Some("de".to_string()); }
+        if pt == max { return Some("pt".to_string()); }
+    }
+
     None
 }
 
@@ -334,6 +437,37 @@ mod tests {
         assert_eq!(result.tables[0].headers, vec!["Name", "Value"]);
         assert_eq!(result.tables[0].rows.len(), 2);
         assert_eq!(result.tables[0].rows[0], vec!["Alpha", "1"]);
+    }
+
+    #[test]
+    fn detect_lang_english() {
+        let result = detect_language_from_text(
+            "The quick brown fox jumps over the lazy dog. This is a simple English sentence with enough words for detection to work properly and identify the language."
+        );
+        assert_eq!(result.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn detect_lang_chinese() {
+        let result = detect_language_from_text(
+            "这是一个中文测试文本。它包含足够多的汉字字符，以便语言检测算法能够正确识别这是中文文本。这个测试应该返回中文语言代码。"
+        );
+        assert_eq!(result.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn detect_lang_spanish() {
+        let result = detect_language_from_text(
+            "Esta es una prueba del detector de idiomas. Los resultados que obtenemos para esta prueba deberían indicar que el idioma es español, con las palabras más comunes del idioma."
+        );
+        assert_eq!(result.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn detect_lang_from_html_attr() {
+        let html = r#"<html lang="fr"><body>Contenu en français</body></html>"#;
+        let result = extract_metadata(html, "https://example.com/");
+        assert_eq!(result.language.as_deref(), Some("fr"));
     }
 
     #[test]

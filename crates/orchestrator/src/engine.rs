@@ -12,6 +12,19 @@ use web_search_indexer::text_index::TextIndex;
 use web_search_ranker::authority;
 use web_search_ranker::pipeline::{RankCandidate, RankingPipeline};
 
+/// Progress update sent during long-running operations.
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    /// Progress fraction (0.0 to 1.0)
+    pub progress: f32,
+    /// Total expected steps (optional)
+    pub total: Option<u64>,
+    /// Current step
+    pub current: u64,
+    /// Human-readable message
+    pub message: String,
+}
+
 /// Central search engine coordinating all components.
 ///
 /// Owns the crawler, extractor, indexer, embedder, and ranker.
@@ -24,6 +37,8 @@ pub struct SearchEngine {
     embedder: Box<dyn Embedder>,
     pipeline: RankingPipeline,
     _config: Config,
+    /// Optional progress callback for long-running operations
+    progress_tx: Option<tokio::sync::broadcast::Sender<ProgressUpdate>>,
 }
 
 impl SearchEngine {
@@ -63,6 +78,8 @@ impl SearchEngine {
         let embedder = web_search_embedder::create_embedder(&config.embedder);
         let pipeline = RankingPipeline::new(config.ranker.clone());
 
+        let (progress_tx, _) = tokio::sync::broadcast::channel(32);
+
         Ok(Self {
             crawler,
             text_index,
@@ -71,7 +88,28 @@ impl SearchEngine {
             embedder,
             pipeline,
             _config: config,
+            progress_tx: Some(progress_tx),
         })
+    }
+
+    /// Subscribe to progress updates for long-running operations.
+    pub fn subscribe_progress(&self) -> Option<tokio::sync::broadcast::Receiver<ProgressUpdate>> {
+        self.progress_tx.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Send a progress update (best-effort, ignores if no subscribers).
+    fn send_progress(&self, current: u64, total: Option<u64>, message: &str) {
+        if let Some(tx) = &self.progress_tx {
+            let progress = total
+                .map(|t| if t > 0 { current as f32 / t as f32 } else { 0.0 })
+                .unwrap_or(0.0);
+            let _ = tx.send(ProgressUpdate {
+                progress,
+                total,
+                current,
+                message: message.to_string(),
+            });
+        }
     }
 
     // ── Smart Tools ──────────────────────────────────────────────────
@@ -97,6 +135,7 @@ impl SearchEngine {
             .collect();
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         tracing::info!(seed_count = seeds.len(), variants = query_variants.len(), "Generated search seeds");
+        self.send_progress(1, Some(5), "Generated search seeds, starting wave 1 crawl");
 
         // Wave 1: Broad crawl
         let wave1_limit = (max_pages / 2).max(10);
@@ -104,6 +143,7 @@ impl SearchEngine {
         let pages = self.crawler.crawl(&seed_refs, wave1_limit, max_depth, wave1_time).await;
 
         tracing::info!(wave1_pages = pages.len(), "Wave 1 complete");
+        self.send_progress(2, Some(5), &format!("Wave 1 complete: {} pages crawled, extracting content", pages.len()));
 
         // Process crawled pages
         let mut candidates = Vec::new();
@@ -136,6 +176,7 @@ impl SearchEngine {
                 ).await;
 
                 tracing::info!(wave2_pages = wave2_pages.len(), "Wave 2 complete");
+                self.send_progress(3, Some(5), &format!("Wave 2 complete: {} additional pages", wave2_pages.len()));
 
                 for page in &wave2_pages {
                     if let Some(candidate) = self.process_crawled_page(page).await {
@@ -148,6 +189,7 @@ impl SearchEngine {
         // Commit index and save vectors to disk
         self.text_index.commit()?;
         self.save_vectors();
+        self.send_progress(4, Some(5), &format!("Indexed {} candidates, running ranking pipeline", candidates.len()));
 
         // Run hybrid search: BM25 + vector ranks merged onto candidates
         self.apply_hybrid_ranks(&mut candidates, query).await;
@@ -155,6 +197,11 @@ impl SearchEngine {
         // Run ranking pipeline
         let top_k = 10;
         let response = self.pipeline.rank(candidates, query, top_k);
+
+        self.send_progress(5, Some(5), &format!(
+            "Deep research complete: {} results from {} pages in {}ms",
+            response.results.len(), pages.len(), start.elapsed().as_millis()
+        ));
 
         tracing::info!(
             total_crawled = pages.len(),
@@ -310,15 +357,38 @@ impl SearchEngine {
         max_results: usize,
     ) -> Result<String> {
         let results = self.text_index.search(query, max_results)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale_threshold = 24 * 3600; // 24 hours
+
+        let mut warnings = Vec::new();
+        let stale_count = results.iter()
+            .filter(|r| r.indexed_at > 0 && now.saturating_sub(r.indexed_at) > stale_threshold)
+            .count();
+        if stale_count > 0 {
+            warnings.push(format!(
+                "{stale_count}/{} results indexed >24h ago — content may be outdated",
+                results.len()
+            ));
+        }
+
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "query": query,
             "total_docs_in_index": self.text_index.num_docs(),
-            "results": results.iter().map(|r| serde_json::json!({
-                "url": r.url,
-                "title": r.title,
-                "domain": r.domain,
-                "score": r.score,
-            })).collect::<Vec<_>>(),
+            "warnings": warnings,
+            "results": results.iter().map(|r| {
+                let age_secs = if r.indexed_at > 0 { now.saturating_sub(r.indexed_at) } else { 0 };
+                serde_json::json!({
+                    "url": r.url,
+                    "title": r.title,
+                    "domain": r.domain,
+                    "score": r.score,
+                    "indexed_at": r.indexed_at,
+                    "age_hours": age_secs / 3600,
+                })
+            }).collect::<Vec<_>>(),
         }))?)
     }
 
@@ -514,7 +584,10 @@ fn generate_search_seeds(query: &str) -> Vec<String> {
     let encoded_underscore = query.to_lowercase().replace(' ', "_");
 
     let mut seeds = vec![
-        // Search engines (HTML versions, no API key)
+        // Major search engines
+        format!("https://www.google.com/search?q={encoded}&num=20"),
+        format!("https://www.bing.com/search?q={encoded}&count=20"),
+        // Alternative search engines (HTML versions, no API key)
         format!("https://search.brave.com/search?q={encoded}"),
         format!("https://www.mojeek.com/search?q={encoded}"),
         format!("https://html.duckduckgo.com/html/?q={encoded}"),

@@ -25,6 +25,8 @@ pub struct TextSearchResult {
     pub domain: String,
     pub score: f32,
     pub source_tier: u64,
+    /// Unix timestamp when document was indexed
+    pub indexed_at: u64,
 }
 
 impl TextIndex {
@@ -91,8 +93,13 @@ impl TextIndex {
         let content_hash_field = self.schema.get_field("content_hash").unwrap();
         let source_tier_field = self.schema.get_field("source_tier").unwrap();
         let confidence_field = self.schema.get_field("extraction_confidence").unwrap();
+        let indexed_at_field = self.schema.get_field("indexed_at").unwrap();
 
         let title = page.title.as_deref().unwrap_or("");
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let writer = self.writer.lock();
         let stamp = writer.add_document(doc!(
@@ -103,6 +110,7 @@ impl TextIndex {
             content_hash_field => page.content_hash.as_bytes(),
             source_tier_field => 4u64, // default tier 4, can be updated
             confidence_field => page.metadata.extraction_confidence as f64,
+            indexed_at_field => now_epoch,
         )).map_err(|e| Error::Index(format!("add doc: {e}")))?;
 
         Ok(stamp)
@@ -127,6 +135,7 @@ impl TextIndex {
         let domain_field = self.schema.get_field("domain").unwrap();
         let body_field = self.schema.get_field("body").unwrap();
         let source_tier_field = self.schema.get_field("source_tier").unwrap();
+        let indexed_at_field = self.schema.get_field("indexed_at").unwrap();
 
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![title_field, body_field]);
@@ -168,6 +177,11 @@ impl TextIndex {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(4);
 
+            let indexed_at = doc
+                .get_first(indexed_at_field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
             results.push(TextSearchResult {
                 doc_id: doc_address.doc_id as u64,
                 url,
@@ -175,6 +189,7 @@ impl TextIndex {
                 domain,
                 score,
                 source_tier,
+                indexed_at,
             });
         }
 

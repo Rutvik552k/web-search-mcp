@@ -8,6 +8,23 @@ use rmcp::{ErrorData as McpError, ServerHandler};
 use web_search_common::config::Config;
 use web_search_orchestrator::SearchEngine;
 
+/// Log progress updates to stderr as structured JSON for MCP-aware clients.
+fn spawn_progress_logger(engine: &SearchEngine) {
+    if let Some(mut rx) = engine.subscribe_progress() {
+        tokio::spawn(async move {
+            while let Ok(update) = rx.recv().await {
+                tracing::info!(
+                    progress = update.progress,
+                    current = update.current,
+                    total = ?update.total,
+                    message = %update.message,
+                    "progress"
+                );
+            }
+        });
+    }
+}
+
 use crate::tools::tool_definitions;
 
 pub struct WebSearchServer {
@@ -20,6 +37,9 @@ impl WebSearchServer {
             .unwrap_or_else(|_| Config::default());
 
         let engine = Arc::new(SearchEngine::new(config)?);
+
+        // Start progress logger for long-running operations
+        spawn_progress_logger(&engine);
 
         tracing::info!("WebSearchServer initialized");
         Ok(Self { engine })

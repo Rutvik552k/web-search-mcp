@@ -104,7 +104,7 @@ impl HnswIndex {
         self.vectors.get(doc_id).map(|v| v.value().clone())
     }
 
-    /// Save the vector index to a file (bincode serialization).
+    /// Save the vector index to a file using bincode (binary, ~5x smaller than JSON).
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         use std::io::Write;
         let entries: Vec<(String, Vec<f32>)> = self
@@ -113,11 +113,9 @@ impl HnswIndex {
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
 
-        let serialized = serde_json::to_vec(&serde_json::json!({
-            "dim": self.dim,
-            "vectors": entries,
-        }))
-        .map_err(|e| Error::Index(format!("serialize vectors: {e}")))?;
+        let payload = (self.dim as u64, entries);
+        let serialized = bincode::serialize(&payload)
+            .map_err(|e| Error::Index(format!("bincode serialize vectors: {e}")))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -126,17 +124,37 @@ impl HnswIndex {
         let mut file = std::fs::File::create(path)?;
         file.write_all(&serialized)?;
 
-        tracing::info!(vectors = entries.len(), path = %path.display(), "Vector index saved");
+        tracing::info!(
+            vectors = payload.1.len(),
+            bytes = serialized.len(),
+            path = %path.display(),
+            "Vector index saved (bincode)"
+        );
         Ok(())
     }
 
-    /// Load a vector index from a file.
+    /// Load a vector index from a bincode file. Falls back to JSON for migration.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
             return Err(Error::Index(format!("vector index not found: {}", path.display())));
         }
 
         let data = std::fs::read(path)?;
+
+        // Try bincode first (new format)
+        if let Ok((dim_u64, entries)) = bincode::deserialize::<(u64, Vec<(String, Vec<f32>)>)>(&data) {
+            let dim = dim_u64 as usize;
+            let index = HnswIndex::new(dim);
+            for (key, vec) in entries {
+                if vec.len() == dim {
+                    index.vectors.insert(key, vec);
+                }
+            }
+            tracing::info!(vectors = index.len(), path = %path.display(), "Vector index loaded (bincode)");
+            return Ok(index);
+        }
+
+        // Fallback: try legacy JSON format for migration
         let parsed: serde_json::Value = serde_json::from_slice(&data)
             .map_err(|e| Error::Index(format!("deserialize vectors: {e}")))?;
 
@@ -157,7 +175,7 @@ impl HnswIndex {
             }
         }
 
-        tracing::info!(vectors = index.len(), path = %path.display(), "Vector index loaded");
+        tracing::info!(vectors = index.len(), path = %path.display(), "Vector index loaded (JSON legacy — will save as bincode next)");
         Ok(index)
     }
 

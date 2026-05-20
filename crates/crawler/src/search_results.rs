@@ -19,18 +19,183 @@ pub fn parse_search_results(url: &str, html: &str) -> Option<Vec<SearchResult>> 
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_lowercase()))?;
 
-    match domain.as_str() {
-        d if d.contains("search.brave.com") => Some(parse_brave(html)),
-        d if d.contains("mojeek.com") => Some(parse_mojeek(html)),
-        d if d.contains("duckduckgo.com") => Some(parse_duckduckgo(html)),
-        d if d.contains("wikipedia.org") && url.contains("search") => Some(parse_wikipedia_search(html)),
-        d if d.contains("arxiv.org") && url.contains("search") => Some(parse_arxiv(html)),
-        d if d.contains("reddit.com") && url.contains("search") => Some(parse_reddit_search(html)),
-        d if d.contains("hn.algolia.com") || d.contains("algolia.com") => Some(parse_hackernews(html)),
-        d if d.contains("scholar.google.com") => Some(parse_google_scholar(html)),
-        d if d.contains("pubmed.ncbi.nlm.nih.gov") => Some(parse_pubmed(html)),
+    let engine_name = match domain.as_str() {
+        d if d.contains("google.com") && !d.contains("scholar") && !d.contains("news") => Some("google"),
+        d if d.contains("bing.com") => Some("bing"),
+        d if d.contains("search.brave.com") => Some("brave"),
+        d if d.contains("mojeek.com") => Some("mojeek"),
+        d if d.contains("duckduckgo.com") => Some("duckduckgo"),
+        d if d.contains("wikipedia.org") && url.contains("search") => Some("wikipedia"),
+        d if d.contains("arxiv.org") && url.contains("search") => Some("arxiv"),
+        d if d.contains("reddit.com") && url.contains("search") => Some("reddit"),
+        d if d.contains("hn.algolia.com") || d.contains("algolia.com") => Some("hackernews"),
+        d if d.contains("scholar.google.com") => Some("scholar"),
+        d if d.contains("pubmed.ncbi.nlm.nih.gov") => Some("pubmed"),
         _ => None,
+    };
+
+    let engine_name = engine_name?;
+    let results = match engine_name {
+        "google" => parse_google(html),
+        "bing" => parse_bing(html),
+        "brave" => parse_brave(html),
+        "mojeek" => parse_mojeek(html),
+        "duckduckgo" => parse_duckduckgo(html),
+        "wikipedia" => parse_wikipedia_search(html),
+        "arxiv" => parse_arxiv(html),
+        "reddit" => parse_reddit_search(html),
+        "hackernews" => parse_hackernews(html),
+        "scholar" => parse_google_scholar(html),
+        "pubmed" => parse_pubmed(html),
+        _ => return None,
+    };
+
+    // Parser health check: warn if page had content but parser extracted nothing
+    if results.is_empty() && html.len() > 2000 {
+        let has_links = html.matches("<a ").count() > 10;
+        if has_links {
+            tracing::warn!(
+                engine = engine_name,
+                url,
+                html_len = html.len(),
+                link_count = html.matches("<a ").count(),
+                "Parser returned 0 results from content-rich page — parser may be outdated"
+            );
+        }
     }
+
+    Some(results)
+}
+
+/// Parse Google web search results.
+///
+/// Google's HTML structure changes frequently. We try multiple strategies:
+/// 1. Structured result divs with cite/a tags
+/// 2. Any external link with reasonable title text
+fn parse_google(html: &str) -> Vec<SearchResult> {
+    let doc = Html::parse_document(html);
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Strategy 1: result blocks — Google wraps results in divs with class "g"
+    // or data-attrid attributes. Links inside typically point to external sites.
+    let selectors = [
+        "div.g a[href]",
+        "div.tF2Cxc a[href]",
+        "div.yuRUbf a[href]",
+        "a[data-ved][href]",
+        "div[data-sokoban-container] a[href]",
+    ];
+
+    for sel_str in &selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            for el in doc.select(&sel) {
+                let href = match el.value().attr("href") {
+                    Some(h) => h,
+                    None => continue,
+                };
+
+                // Google uses /url?q=ACTUAL_URL&... redirect pattern
+                let actual_url = if href.contains("/url?") && href.contains("q=") {
+                    href.split("q=")
+                        .nth(1)
+                        .and_then(|u| u.split('&').next())
+                        .and_then(|u| urlencoding_decode(u))
+                        .unwrap_or_else(|| href.to_string())
+                } else if href.starts_with("http") && !href.contains("google.com") {
+                    href.to_string()
+                } else {
+                    continue;
+                };
+
+                if !actual_url.starts_with("http") || actual_url.contains("google.com") {
+                    continue;
+                }
+                if !seen.insert(actual_url.clone()) || is_noise_url(&actual_url) {
+                    continue;
+                }
+
+                let title = el.text().collect::<String>().trim().to_string();
+                if title.len() < 3 {
+                    continue;
+                }
+
+                results.push(SearchResult {
+                    url: actual_url,
+                    title,
+                    snippet: String::new(),
+                });
+            }
+        }
+        if results.len() >= 5 {
+            break;
+        }
+    }
+
+    // Strategy 2: broad fallback — any external http link not to google
+    if results.is_empty() {
+        results = extract_all_external_links(&doc, "google.com", &mut seen);
+    }
+
+    results.truncate(15);
+    results
+}
+
+/// Parse Bing search results.
+///
+/// Bing uses <li class="b_algo"> containers with <h2><a href="..."> for result links.
+fn parse_bing(html: &str) -> Vec<SearchResult> {
+    let doc = Html::parse_document(html);
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Strategy 1: Bing algo results
+    let selectors = [
+        "li.b_algo h2 a[href]",
+        "li.b_algo a[href]",
+        "ol#b_results li a[href]",
+        ".b_title a[href]",
+    ];
+
+    for sel_str in &selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            for el in doc.select(&sel) {
+                let href = match el.value().attr("href") {
+                    Some(h) if h.starts_with("http") => h,
+                    _ => continue,
+                };
+
+                if href.contains("bing.com") || href.contains("microsoft.com/bing") {
+                    continue;
+                }
+                if !seen.insert(href.to_string()) || is_noise_url(href) {
+                    continue;
+                }
+
+                let title = el.text().collect::<String>().trim().to_string();
+                if title.len() < 3 {
+                    continue;
+                }
+
+                results.push(SearchResult {
+                    url: href.to_string(),
+                    title,
+                    snippet: String::new(),
+                });
+            }
+        }
+        if results.len() >= 5 {
+            break;
+        }
+    }
+
+    // Strategy 2: fallback
+    if results.is_empty() {
+        results = extract_all_external_links(&doc, "bing.com", &mut seen);
+    }
+
+    results.truncate(15);
+    results
 }
 
 /// Parse Brave Search results.
@@ -788,9 +953,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_google_results() {
+        let html = r#"<html><body>
+            <div class="g"><div class="yuRUbf"><a href="https://rust-lang.org/">Rust Language</a></div></div>
+            <div class="g"><div class="yuRUbf"><a href="https://doc.rust-lang.org/book/">The Book</a></div></div>
+            <a href="https://www.google.com/settings">Settings</a>
+        </body></html>"#;
+
+        let results = parse_google(html);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://rust-lang.org/");
+    }
+
+    #[test]
+    fn parse_google_redirect_urls() {
+        let html = r#"<html><body>
+            <div class="g"><a data-ved="abc" href="/url?q=https%3A%2F%2Fexample.com%2Fpage&sa=U">Example</a></div>
+        </body></html>"#;
+
+        let results = parse_google(html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.com/page");
+    }
+
+    #[test]
+    fn parse_bing_results() {
+        let html = r#"<html><body>
+            <ol id="b_results">
+                <li class="b_algo"><h2><a href="https://rust-lang.org/">Rust</a></h2></li>
+                <li class="b_algo"><h2><a href="https://doc.rust-lang.org/">Docs</a></h2></li>
+            </ol>
+        </body></html>"#;
+
+        let results = parse_bing(html);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://rust-lang.org/");
+    }
+
+    #[test]
     fn detect_search_page() {
         assert!(parse_search_results("https://search.brave.com/search?q=test", "<html></html>").is_some());
         assert!(parse_search_results("https://www.mojeek.com/search?q=test", "<html></html>").is_some());
+        assert!(parse_search_results("https://www.google.com/search?q=test", "<html></html>").is_some());
+        assert!(parse_search_results("https://www.bing.com/search?q=test", "<html></html>").is_some());
         assert!(parse_search_results("https://example.com/article", "<html></html>").is_none());
     }
 

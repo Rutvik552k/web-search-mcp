@@ -48,6 +48,15 @@ dashmap = "6"
 crossbeam = "0.8"
 petgraph = "0.6"
 
+# Caching
+moka = { version = "0.12", features = ["future"] }
+
+# Binary serialization
+bincode = "1"
+
+# Regex
+regex = "1"
+
 # MCP
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 

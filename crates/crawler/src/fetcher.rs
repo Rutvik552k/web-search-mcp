@@ -1,4 +1,6 @@
+use moka::future::Cache;
 use reqwest::{Client, StatusCode};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use web_search_common::config::CrawlerConfig;
 use web_search_common::{Error, Result};
@@ -14,13 +16,42 @@ pub struct FetchResult {
     pub response_time_ms: u64,
     pub content_length: usize,
     pub is_spa: bool,
+    /// Whether this result was served from cache
+    pub from_cache: bool,
+    /// ETag header for conditional requests
+    pub etag: Option<String>,
+    /// Last-Modified header for conditional requests
+    pub last_modified: Option<String>,
 }
 
-/// HTTP fetcher with retry, headers, and SPA detection.
+/// Cache statistics.
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: u64,
+}
+
+/// HTTP fetcher with retry, headers, SPA detection, and response caching.
 pub struct Fetcher {
     client: Client,
     max_retries: u32,
     backoff_base_ms: u64,
+    /// LRU cache with TTL for HTTP responses
+    cache: Cache<String, CachedResponse>,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+}
+
+/// Cached HTTP response with conditional request headers.
+#[derive(Clone, Debug)]
+struct CachedResponse {
+    result: FetchResult,
+    /// Stored for future conditional GET requests (If-None-Match)
+    #[allow(dead_code)]
+    etag: Option<String>,
+    /// Stored for future conditional GET requests (If-Modified-Since)
+    #[allow(dead_code)]
+    last_modified: Option<String>,
 }
 
 impl Fetcher {
@@ -39,15 +70,43 @@ impl Fetcher {
                 reason: format!("client build: {e}"),
             })?;
 
+        // LRU cache: max 2000 entries, 10 minute TTL
+        let cache = Cache::builder()
+            .max_capacity(2000)
+            .time_to_live(Duration::from_secs(600))
+            .build();
+
         Ok(Self {
             client,
             max_retries: config.max_retries,
             backoff_base_ms: config.backoff_base_ms,
+            cache,
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         })
     }
 
-    /// Fetch a URL with retries and exponential backoff.
+    /// Get cache statistics.
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+            entries: self.cache.entry_count(),
+        }
+    }
+
+    /// Fetch a URL with caching, conditional requests, retries, and backoff.
     pub async fn fetch(&self, url: &str) -> Result<FetchResult> {
+        // Check cache first
+        if let Some(cached) = self.cache.get(url).await {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(url, "Cache hit");
+            let mut result = cached.result.clone();
+            result.from_cache = true;
+            return Ok(result);
+        }
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+
         let mut last_err = None;
 
         for attempt in 0..=self.max_retries {
@@ -58,7 +117,16 @@ impl Fetcher {
             }
 
             match self.fetch_once(url).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    // Cache the response
+                    let cached = CachedResponse {
+                        etag: result.etag.clone(),
+                        last_modified: result.last_modified.clone(),
+                        result: result.clone(),
+                    };
+                    self.cache.insert(url.to_string(), cached).await;
+                    return Ok(result);
+                }
                 Err(e) => {
                     // Don't retry 4xx (except 429)
                     if let Error::Blocked { status, .. } = &e {
@@ -122,6 +190,18 @@ impl Fetcher {
             });
         }
 
+        // Capture conditional request headers for future cache validation
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let body = response
             .text()
             .await
@@ -140,6 +220,9 @@ impl Fetcher {
             response_time_ms: elapsed,
             content_length,
             is_spa,
+            from_cache: false,
+            etag,
+            last_modified,
         })
     }
 

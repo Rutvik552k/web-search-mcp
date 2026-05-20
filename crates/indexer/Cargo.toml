@@ -19,3 +19,4 @@ chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 sha2 = "0.10"
 url = { workspace = true }
+bincode = { workspace = true }

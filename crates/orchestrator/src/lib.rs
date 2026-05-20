@@ -2,4 +2,4 @@ pub mod engine;
 pub mod query;
 pub mod tools;
 
-pub use engine::SearchEngine;
+pub use engine::{SearchEngine, ProgressUpdate};

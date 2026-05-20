@@ -24,5 +24,8 @@ pub fn build_schema() -> Schema {
     // Extraction confidence
     builder.add_f64_field("extraction_confidence", FAST | STORED);
 
+    // Timestamp when document was indexed (unix epoch seconds)
+    builder.add_u64_field("indexed_at", FAST | STORED);
+
     builder.build()
 }

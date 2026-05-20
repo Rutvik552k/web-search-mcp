@@ -4,21 +4,28 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 
 ## What It Does
 
-- **Crawls the web directly** — no search API keys needed, parses 9 search engines (Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed)
+- **Crawls the web directly** — no search API keys needed, parses 11 search engines (Google, Bing, Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed)
+- **HTTP response caching** — LRU cache (moka) with 10-minute TTL avoids re-fetching, captures ETag/Last-Modified for conditional requests
 - **Parallel crawling** — concurrent batch fetching with per-domain rate limiting
 - **Extracts clean content** — 2-pass consensus extraction (Readability + Trafilatura-inspired) with CSS/JS sanitization
+- **Language detection** — auto-detects page language from HTML attributes or text analysis (11 languages: en, zh, ja, ko, ar, ru, hi, es, fr, de, pt)
 - **Neural embeddings** — all-MiniLM-L6-v2 via Candle (pure Rust, no Python) for semantic search
 - **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 for token-level relevance scoring
 - **NLI contradiction detection** — nli-deberta-v3-small classifies claim pairs as entailment/contradiction/neutral
 - **5-stage anti-hallucination pipeline** — ISR fusion, cross-encoder rerank, authority scoring, NLI contradiction detection, diversity filtering
-- **Persistent storage** — tantivy index + HNSW vectors + dedup state survive across sessions
-- **Query reformulation** — synonym expansion for better recall
+- **Persistent storage** — tantivy index + HNSW vectors (bincode binary format) + dedup state survive across sessions
+- **Index staleness tracking** — documents stamped with `indexed_at`, search results warn when content is >24h old
+- **Query reformulation** — 40+ synonym pairs, domain-specific expansion (medical, scientific, news, technical), question variant generation
+- **Enhanced NER** — regex-based extraction of emails, URLs, dates, money, percentages, phone numbers plus capitalized phrase detection
+- **Progress notifications** — broadcast channel reports 5-stage progress during deep_research for MCP-aware clients
+- **Parser health monitoring** — detects when search engine parsers return 0 results from content-rich pages, logs warnings for outdated parsers
 - **Works with any LLM** — standard MCP protocol over stdio
 
 ## Architecture
 
 ```
                          MCP Server (stdio, concurrent)
+                         Progress Notifications
                               |
                          Orchestrator
                      /    |    |    \
@@ -26,12 +33,14 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
                   |        |         |        |
               Parallel   2-Pass    Tantivy   5-Stage Pipeline
               HTTP Fetch  Consensus  HNSW     Cross-Encoder Rerank
-              Search      CSS/JS    SimHash   NLI Contradictions
-              Result      Sanitize  Dedup     Authority + Freshness
-              Parser      Snippets  Persist   MMR Diversity
-              Sitemap     Metadata    |
-              Robots.txt  Chunker  Embedder
-              Pagination          MiniLM-L6 (Candle)
+              LRU Cache   CSS/JS    SimHash   NLI Contradictions
+              11 Search   Sanitize  Dedup     Authority + Freshness
+              Engines     Snippets  Bincode   MMR Diversity
+              Parser      Metadata  TTL         |
+              Health      Language  Persist   Embedder
+              Sitemap     Chunker     |       MiniLM-L6 (Candle)
+              Robots.txt  NER       Indexed
+              Pagination            At Tracking
 ```
 
 ### 8 Crates
@@ -39,13 +48,13 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 | Crate | Purpose |
 |-------|---------|
 | `common` | Data models, config, errors, logging |
-| `crawler` | Parallel crawler with search result parsing, SPA detection, robots.txt, rate limiting, pagination, sitemap |
-| `extractor` | Readability + Trafilatura extraction, CSS/JS sanitization, metadata, JSON-LD, tables, snippet extraction, chunking |
-| `indexer` | Tantivy full-text (disk-backed) + HNSW vectors (persistent) + SimHash/dedup (persistent) |
+| `crawler` | Parallel crawler with LRU response cache, 11 search engine parsers, parser health monitoring, SPA detection, robots.txt, rate limiting, pagination, sitemap |
+| `extractor` | Readability + Trafilatura extraction, CSS/JS sanitization, language detection (11 languages), metadata, JSON-LD, tables, snippet extraction, chunking |
+| `indexer` | Tantivy full-text (disk-backed) + HNSW vectors (bincode binary format) + SimHash/dedup (persistent) + TTL staleness tracking |
 | `embedder` | CandleEmbedder (neural, default) + HashEmbedder (fallback) + CrossEncoder (reranking + NLI) |
 | `ranker` | 5-stage anti-hallucination ranking pipeline with ML models |
-| `orchestrator` | Research flow engine with query reformulation, hybrid search wiring |
-| `mcp-server` | MCP protocol layer with 13 tool definitions, concurrent tool calls |
+| `orchestrator` | Research flow engine with 40+ synonym query reformulation, domain-specific expansion, enhanced regex NER, progress broadcasting |
+| `mcp-server` | MCP protocol layer with 13 tool definitions, concurrent tool calls, progress logging |
 
 ## 13 MCP Tools
 
@@ -53,7 +62,7 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 
 | Tool | Description |
 |------|-------------|
-| `deep_research` | Multi-wave crawl across hundreds of pages. Query reformulation with synonym expansion. Follows search result links, pagination. Returns verified results with confidence scores, claim attribution, and NLI-based contradiction detection |
+| `deep_research` | Multi-wave crawl across hundreds of pages with 5-stage progress reporting. Query reformulation with 40+ synonyms and domain-specific expansion. Follows search result links, pagination. Returns verified results with confidence scores, claim attribution, and NLI-based contradiction detection |
 | `quick_search` | Fast single-wave search (~15s). Good for simple factual questions |
 | `explore_topic` | Discovery mode — broadly explores a topic, builds entity connections |
 | `verify_claim` | Fact-checking — searches for evidence supporting or contradicting a claim. Reports source diversity and contradiction severity |
@@ -67,9 +76,9 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 | `extract` | Extract clean text using 2-pass consensus with CSS/JS sanitization |
 | `follow_links` | Follow links from a page, optionally filtered by URL pattern or anchor text |
 | `paginate` | Auto-detect and follow pagination (5 patterns: query param, offset, cursor, path segment, rel=next) |
-| `search_index` | Query the persistent local full-text index from previously crawled content |
+| `search_index` | Query the persistent local full-text index from previously crawled content. Reports document age and warns on stale results (>24h) |
 | `find_similar` | Find semantically similar content using neural vector embeddings (MiniLM-L6) |
-| `get_entities` | Extract named entities (persons, organizations, locations, dates) with type classification |
+| `get_entities` | Extract named entities using regex patterns (emails, URLs, dates, money, percentages, phone numbers) and capitalized phrase detection (persons, organizations, locations) |
 | `get_link_graph` | Map outgoing links from a URL with anchor text and external/internal classification |
 
 ## Anti-Hallucination Pipeline
@@ -336,34 +345,49 @@ The server maintains persistent state across sessions:
 
 ```
 data/
-├── index/          # Tantivy full-text search index (mmap-backed)
+├── index/          # Tantivy full-text search index (mmap-backed, with indexed_at timestamps)
 ├── vectors/
-│   └── hnsw.json   # HNSW vector embeddings (384-dim per document)
+│   └── hnsw.json   # HNSW vector embeddings (384-dim, bincode binary format — auto-migrates from JSON)
 └── dedup.json      # URL seen set + SimHash fingerprints + content hashes
 ```
 
 - First search builds the index from scratch
 - Subsequent searches query existing index AND crawl new content
 - Index grows over time as more content is crawled
+- Each document tracks `indexed_at` timestamp — search results report age and warn on stale content (>24h)
+- Vector index uses bincode binary serialization (~5x smaller, faster load/save than JSON)
+- HTTP responses cached in-memory (LRU, 2000 entries, 10-minute TTL) to avoid re-fetching during a session
 - Delete `data/` directory to reset
 
 ## Search Engine Coverage
 
-The crawler parses search result pages from 9 engines and follows actual result links:
+The crawler parses search result pages from 11 engines and follows actual result links:
 
 | Engine | What's Extracted |
 |--------|-----------------|
+| Google | Result links (handles `/url?q=` redirects, multi-selector fallback) |
+| Bing | Result links (`li.b_algo` containers, `h2 a` selectors) |
 | Brave Search | Result links (class `l1`) |
 | Mojeek | Result links (class `title`) |
 | DuckDuckGo | Result links (decoded redirect URLs) |
 | Wikipedia | Article links from search results |
 | ArXiv | Paper abstract links (`/abs/`) |
 | Reddit (old) | Comment thread links (`/comments/`) |
-| Hacker News | External links from stories |
+| Hacker News | External links from stories (Algolia JSON API) |
 | Google Scholar | Paper links |
-| PubMed | Article links (numeric IDs) |
+| PubMed | Article links (numeric IDs, `docsum-title` class) |
 
-Query reformulation generates synonym variants (e.g., "impact" → "effect", "climate change" → "global warming") and searches multiple engines per variant.
+**Parser health monitoring**: If any parser returns 0 results from a content-rich page (>2KB HTML, >10 links), a warning is logged identifying the potentially outdated parser.
+
+### Query Reformulation
+
+Query expansion generates multiple search variants per query:
+
+- **40+ synonym pairs** — "impact" -> "effect"/"influence", "machine learning" -> "AI"/"ML", "fast" -> "quick"/"rapid"/"high-performance", etc.
+- **Domain-specific expansion** — medical queries add "clinical study", scientific add "research paper", news add current year
+- **Question variants** — short queries get "what is X" variant, question queries get declarative variant
+- **Technical expansion** — tech queries add "documentation" and "tutorial" variants
+- **Up to 6 variants** searched across all 11 engines per variant
 
 ## Tests
 
@@ -371,14 +395,16 @@ Query reformulation generates synonym variants (e.g., "impact" → "effect", "cl
 cargo test
 ```
 
-166 tests across all crates:
+179 tests across all crates:
 
-- Search result parser (Brave, Mojeek, Wikipedia, ArXiv — 7 tests)
+- Search result parsers (Google, Bing, Brave, Mojeek, Wikipedia, ArXiv — 12 tests)
+- Parser health detection + dedup (3 tests)
 - Content extraction accuracy + CSS sanitization (10 tests)
 - Snippet extraction relevance (4 tests)
+- Language detection (English, Chinese, Spanish, HTML lang attr — 4 tests)
 - SimHash near-duplicate detection (3 tests)
 - HNSW vector search (5 tests)
-- Tantivy full-text index (3 tests)
+- Tantivy full-text index with indexed_at timestamps (3 tests)
 - Dedup store (exact + near + URL — 5 tests)
 - ISR fusion + MMR diversity (4 tests)
 - Query type detection (5 tests)
@@ -389,23 +415,41 @@ cargo test
 - Pagination pattern detection + URL generation (7 tests)
 - Robots.txt parsing + cache (7 tests)
 - Link extraction and resolution (7 tests)
-- Query reformulation with synonyms (5 tests)
+- Query reformulation with synonyms + domain expansion (8 tests)
 - Sitemap XML parsing (3 tests)
 - Cosine similarity + embeddings (10 tests)
+- NER regex extraction (emails, money, dates, percentages — 7 tests)
 
 ## Project Stats
 
 | Metric | Value |
 |--------|-------|
 | Language | Rust (edition 2024) |
-| Total lines of code | ~16,000 |
+| Total lines of code | ~17,500 |
 | Crates | 8 |
 | MCP tools | 13 (5 smart + 8 atomic) |
-| Tests | 166 passing |
+| Search engines | 11 (Google, Bing, Brave, Mojeek, DDG, Wikipedia, ArXiv, Reddit, HN, Scholar, PubMed) |
+| Tests | 179 passing |
 | ML models | 3 (auto-downloaded) |
+| Language detection | 11 languages |
+| Synonym pairs | 40+ |
 | Binary size | ~27MB (release) |
 | Ranking pipeline latency | ~77ms |
 | External API dependencies | 0 |
+
+## Recent Changes
+
+### v0.2.0 — Gap Fixes
+
+- **Google + Bing search parsers** — added parsers for the two largest search engines with multi-selector fallbacks and redirect URL decoding
+- **HTTP response cache** — moka LRU cache (2000 entries, 10min TTL) avoids re-fetching same URLs within a session, captures ETag/Last-Modified headers
+- **Parser health monitoring** — warns when a search engine parser returns 0 results from a content-rich page, helping detect when parsers become outdated
+- **Index staleness tracking** — all indexed documents stamped with `indexed_at` timestamp, `search_index` tool reports document age and warns on >24h stale content
+- **Bincode vector serialization** — switched HNSW vectors from JSON to bincode binary format (~5x smaller files, faster load/save), auto-migrates legacy JSON on first load
+- **Enhanced NER** — regex-based extraction of emails, URLs, dates (4 formats), money ($, EUR, GBP, JPY), percentages, phone numbers, plus improved capitalized phrase detection with product/org heuristics
+- **Progress notifications** — broadcast channel reports 5-stage progress during `deep_research` (seed generation, wave 1, wave 2, indexing, ranking), logged as structured tracing events for MCP-aware clients
+- **Language detection** — text-based language detection using Unicode block analysis + stopword frequency covering 11 languages (en, zh, ja, ko, ar, ru, hi, es, fr, de, pt), falls back when HTML `lang` attribute is missing
+- **Expanded query reformulation** — 40+ synonym pairs (up from 16), domain-specific expansion (medical -> "clinical study", scientific -> "research paper", news -> current year), question variant generation, increased variant limit from 4 to 6
 
 ## License
 

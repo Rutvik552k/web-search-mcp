@@ -3,6 +3,10 @@ name = "web-search-ranker"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+onnx = ["web-search-embedder/onnx"]
+
 [dependencies]
 web-search-common = { workspace = true }
 web-search-indexer = { workspace = true }

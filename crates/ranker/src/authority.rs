@@ -47,12 +47,15 @@ pub fn authority_boost(tier: SourceTier) -> f32 {
 
 fn is_tier1_domain(d: &str) -> bool {
     let tier1 = [
-        "nature.com", "science.org", "thelancet.com",
-        "who.int", "nasa.gov", "cdc.gov", "nih.gov",
+        // Academic journals & publishers
+        "nature.com", "science.org", "sciencedirect.com", "springer.com",
+        "thelancet.com", "bmj.com", "nejm.org", "cell.com", "pnas.org",
         "arxiv.org", "pubmed.ncbi.nlm.nih.gov",
-        "ieee.org", "acm.org", "springer.com",
-        "sciencedirect.com", "cell.com", "pnas.org",
-        "bmj.com", "nejm.org", "worldbank.org",
+        // Standards bodies & professional orgs
+        "w3.org", "ietf.org", "ieee.org", "acm.org",
+        // Government & intergovernmental
+        "who.int", "nasa.gov", "nist.gov", "worldbank.org",
+        "cdc.gov", "nih.gov", "fda.gov", "epa.gov", "sec.gov",
         "un.org", "europa.eu",
     ];
     tier1.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))

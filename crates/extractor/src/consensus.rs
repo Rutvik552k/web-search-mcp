@@ -35,7 +35,7 @@ fn sanitize_html(html: &str) -> String {
 }
 
 /// Clean extracted body text: remove residual CSS, collapse whitespace.
-fn clean_body_text(text: &str) -> String {
+fn clean_css_artifacts(text: &str) -> String {
     let mut cleaned = text.to_string();
 
     // Remove any CSS that leaked through (e.g., .mw-parser-output ul.cslist{...})
@@ -93,9 +93,9 @@ pub fn extract_page(html: &str, url: &str) -> ExtractionResult {
 
     // Pick best body text by confidence, then clean
     let (body_text, confidence) = if traf_result.confidence >= read_result.confidence {
-        (clean_body_text(&traf_result.body_text), traf_result.confidence)
+        (clean_css_artifacts(&traf_result.body_text), traf_result.confidence)
     } else {
-        (clean_body_text(&read_result.body_text), read_result.confidence)
+        (clean_css_artifacts(&read_result.body_text), read_result.confidence)
     };
 
     // If both produced content, boost confidence
@@ -169,6 +169,145 @@ pub fn to_page(
         content_hash: content_hash.to_string(),
         crawled_at: Utc::now(),
     }
+}
+
+// ── Data Quality Filters ─────────────────────────────────────────────
+
+/// Public filter: remove code blocks, CTAs, navigation, and fix unicode.
+/// Call on body_text after extraction to clean up non-factual content.
+pub fn clean_body_text(text: &str) -> String {
+    let cleaned: String = text
+        .lines()
+        .filter(|line| !is_code_line(line))
+        .filter(|line| !is_cta_line(line))
+        .filter(|line| !is_navigation_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalize_unicode(&cleaned)
+}
+
+/// Detect if a line is source code.
+fn is_code_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let code_starts = [
+        "fn ", "pub fn ", "async fn ", "impl ", "struct ", "enum ", "trait ", "mod ",
+        "use ", "#[", "//", "/*", "*/",
+        "def ", "class ", "import ", "from ", "__",
+        "function ", "const ", "let ", "var ", "=>",
+        "#include", "int main", "void ", "std::", "namespace ",
+        "package ", "public class", "private ", "protected ",
+    ];
+    if code_starts.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+
+    // High density of code-like characters
+    let code_chars = trimmed
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '(' | ')' | ';' | '#' | '=' | '<' | '>' | '[' | ']'))
+        .count();
+    if trimmed.len() > 20 && code_chars as f32 / trimmed.len() as f32 > 0.15 {
+        return true;
+    }
+
+    // Stack trace lines
+    if trimmed.starts_with("at ") && trimmed.contains('(') && trimmed.contains(':') {
+        return true;
+    }
+
+    false
+}
+
+/// Detect CTA / marketing / boilerplate lines.
+fn is_cta_line(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let patterns = [
+        "contact us",
+        "sign up",
+        "subscribe",
+        "free trial",
+        "get started",
+        "book a demo",
+        "schedule a call",
+        "request a quote",
+        "click here",
+        "download now",
+        "buy now",
+        "order now",
+        "follow us on",
+        "share this",
+        "tweet this",
+        "cookie policy",
+        "privacy policy",
+        "terms of service",
+        "all rights reserved",
+        "copyright ©",
+        "powered by",
+        "free consultation",
+        "free estimate",
+    ];
+    patterns.iter().any(|p| lower.contains(p))
+}
+
+/// Detect navigation/menu lines.
+fn is_navigation_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return true;
+    }
+    // Breadcrumbs
+    if trimmed.contains(" > ") && trimmed.split(" > ").count() >= 3 {
+        return true;
+    }
+    false
+}
+
+/// Normalize unicode: fix smart quotes, remove control chars.
+fn normalize_unicode(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' => '\'',
+            '\u{201C}' | '\u{201D}' => '"',
+            '\u{2013}' | '\u{2014}' => '-',
+            '\u{00A0}' | '\u{200B}' | '\u{FEFF}' => ' ',
+            c if c.is_control() && c != '\n' && c != '\r' && c != '\t' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+/// Detect if content is a search engine results page (SERP/listing).
+pub fn is_serp_page(url: &str, body_text: &str) -> bool {
+    let url_lower = url.to_lowercase();
+    let serp_patterns = [
+        "/search?",
+        "/search/?",
+        "?q=",
+        "?query=",
+        "/releases/search",
+        "/packages?",
+        "/repositories?",
+        "special:search",
+        "/w/index.php?search",
+    ];
+
+    if serp_patterns.iter().any(|p| url_lower.contains(p)) {
+        let lines: Vec<&str> = body_text.lines().filter(|l| l.len() > 10).collect();
+        if lines.len() > 5 {
+            let short = lines.iter().filter(|l| l.len() < 100).count();
+            if short as f32 / lines.len() as f32 > 0.7 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -275,7 +414,7 @@ mod tests {
     #[test]
     fn clean_body_removes_css_leaks() {
         let dirty = ".mw-parser-output ul.cslist{margin:0;padding:0}\nActual content here.\nMore real text.";
-        let cleaned = clean_body_text(dirty);
+        let cleaned = clean_css_artifacts(dirty);
         assert!(!cleaned.contains("mw-parser-output"));
         assert!(cleaned.contains("Actual content"));
     }

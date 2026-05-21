@@ -11,6 +11,14 @@ pub async fn dispatch_tool(
 ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match tool_name {
         // ── Smart Tools ──────────────────────────────────────────
+        "instant_search" => {
+            let query = get_str(args, "query")?;
+            let max_results = get_u64(args, "max_results").unwrap_or(5) as usize;
+
+            let response = engine.instant_search(&query, max_results).await?;
+            Ok(serde_json::to_string_pretty(&response)?)
+        }
+
         "deep_research" => {
             let query = get_str(args, "query")?;
             let max_pages = get_u64(args, "max_pages").unwrap_or(500) as usize;

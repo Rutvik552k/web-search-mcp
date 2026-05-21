@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Result of browser-rendered page fetch.
 #[derive(Debug, Clone)]

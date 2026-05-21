@@ -1,10 +1,22 @@
 use rmcp::model::Tool;
 use std::sync::Arc;
 
-/// Define all 13 MCP tools — 5 smart + 8 atomic.
+/// Define all 14 MCP tools — 6 smart + 8 atomic.
 pub fn tool_definitions() -> Vec<Tool> {
     vec![
         // ── Smart Tools (high-level intent) ──────────────────────────────
+        make_tool(
+            "instant_search",
+            "Ultra-fast search (~1-2s). Uses SearXNG + BM25 ranking. Best for simple factual queries.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "max_results": { "type": "integer", "default": 5, "description": "Max results to return" }
+                },
+                "required": ["query"]
+            }),
+        ),
         make_tool(
             "deep_research",
             "Multi-wave deep research: crawls hundreds of pages across multiple waves, follows links and pagination, indexes content, ranks with anti-hallucination pipeline. Returns verified results with confidence scores, claim attribution, and contradiction detection.",

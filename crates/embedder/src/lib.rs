@@ -1,6 +1,12 @@
 mod hash_embedder;
 pub mod cross_encoder;
 
+#[cfg(feature = "onnx")]
+mod onnx_embedder;
+
+#[cfg(feature = "onnx")]
+pub mod onnx_cross_encoder;
+
 #[cfg(feature = "candle")]
 mod candle_embedder;
 
@@ -9,6 +15,9 @@ use web_search_common::Result;
 
 pub use hash_embedder::HashEmbedder;
 pub use cross_encoder::{CrossEncoder, CrossEncoderScore, NliLabel};
+
+#[cfg(feature = "onnx")]
+pub use onnx_embedder::OnnxEmbedder;
 
 #[cfg(feature = "candle")]
 pub use candle_embedder::CandleEmbedder;

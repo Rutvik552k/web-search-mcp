@@ -16,6 +16,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Web Search MCP Server v{}", env!("CARGO_PKG_VERSION"));
 
     let server = server::WebSearchServer::new()?;
+
+    // Pre-warm ML models in background — first real query won't pay cold-start cost
+    let warmup_start = std::time::Instant::now();
+    if let Err(e) = server.warmup().await {
+        tracing::warn!("Warmup failed (non-fatal): {e}");
+    } else {
+        tracing::info!(elapsed_ms = warmup_start.elapsed().as_millis() as u64, "ML models warmed up");
+    }
+
     let transport = rmcp::transport::io::stdio();
     let service = server.serve(transport).await?;
     service.waiting().await?;

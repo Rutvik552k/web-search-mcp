@@ -6,8 +6,12 @@ edition.workspace = true
 [features]
 default = ["candle"]
 no-ml = []  # explicitly disable ML for minimal builds
-onnx = ["ort"]
+onnx = ["ort", "ndarray", "dep:hf-hub", "dep:tokenizers"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
+# GPU acceleration via ONNX Runtime CUDA execution provider.
+# Requires: NVIDIA GPU + CUDA 11.6+ + cuDNN installed on the system.
+# Usage: cargo build --features onnx,gpu
+gpu = ["onnx", "ort/cuda"]
 
 [dependencies]
 web-search-common = { workspace = true }
@@ -21,6 +25,7 @@ siphasher = "1"
 
 # ONNX Runtime (optional — requires prebuilt binaries for target platform)
 ort = { version = "2.0.0-rc.12", optional = true }
+ndarray = { version = "0.16", optional = true }
 
 # Candle: pure-Rust ML framework (optional)
 candle-core = { version = "0.8", optional = true }

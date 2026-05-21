@@ -37,12 +37,8 @@ pub fn check_hallucination(docs: &[DocClaims], min_orgs: usize) -> Hallucination
 
     let echo_chamber_risk = unique_orgs < min_orgs && docs.len() >= min_orgs;
     if echo_chamber_risk {
-        warnings.push(format!(
-            "Limited source diversity: only {} unique organizations in top {} results (minimum: {})",
-            unique_orgs,
-            docs.len(),
-            min_orgs
-        ));
+        let domains: Vec<String> = docs.iter().map(|d| d.domain.clone()).collect();
+        warnings.push(echo_chamber_warning(unique_orgs, min_orgs, &domains));
     }
 
     // Cross-reference: count how many documents mention each key phrase
@@ -163,6 +159,18 @@ pub fn check_hallucination(docs: &[DocClaims], min_orgs: usize) -> Hallucination
         unique_orgs,
         echo_chamber_risk,
     }
+}
+
+/// Format echo chamber warning with domain details.
+fn echo_chamber_warning(unique_orgs: usize, min_orgs: usize, domains: &[String]) -> String {
+    let sample: Vec<&str> = domains.iter().take(5).map(|s| s.as_str()).collect();
+    format!(
+        "Limited source diversity: only {} unique organizations in {} results (minimum: {}). Domains: {}",
+        unique_orgs,
+        domains.len(),
+        min_orgs,
+        sample.join(", ")
+    )
 }
 
 /// Extract claims containing numbers for contradiction detection.

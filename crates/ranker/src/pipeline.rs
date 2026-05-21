@@ -1,7 +1,10 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use web_search_common::config::RankerConfig;
 use web_search_common::models::*;
-use web_search_embedder::{CrossEncoder, NliLabel};
+use web_search_embedder::cross_encoder::{CrossEncoderScore, NliLabel};
+use web_search_embedder::CrossEncoder;
 use web_search_indexer::simhash;
 
 use crate::authority;
@@ -9,6 +12,40 @@ use crate::diversity::{self, DiversityCandidate};
 use crate::freshness;
 use crate::hallucination::{self, DocClaims};
 use crate::query_type;
+
+/// Backend-agnostic cross-encoder wrapper.
+/// Tries ONNX Runtime first (5-10x faster), falls back to Candle.
+enum Reranker {
+    #[cfg(feature = "onnx")]
+    Onnx(web_search_embedder::onnx_cross_encoder::OnnxCrossEncoder),
+    Candle(CrossEncoder),
+}
+
+impl Reranker {
+    fn score_pairs(&self, pairs: &[(&str, &str)]) -> web_search_common::Result<Vec<CrossEncoderScore>> {
+        match self {
+            #[cfg(feature = "onnx")]
+            Reranker::Onnx(m) => m.score_pairs(pairs),
+            Reranker::Candle(m) => m.score_pairs(pairs),
+        }
+    }
+
+    fn classify_from_logits(&self, logits: &[f32]) -> (NliLabel, f32) {
+        match self {
+            #[cfg(feature = "onnx")]
+            Reranker::Onnx(m) => m.classify_from_logits(logits),
+            Reranker::Candle(m) => m.classify_from_logits(logits),
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        match self {
+            #[cfg(feature = "onnx")]
+            Reranker::Onnx(m) => m.model_id(),
+            Reranker::Candle(m) => m.model_id(),
+        }
+    }
+}
 
 /// 5-stage anti-hallucination ranking pipeline.
 ///
@@ -19,10 +56,12 @@ use crate::query_type;
 /// Stage 5: Diversity filter (MMR + domain cap + dedup) → final top K
 pub struct RankingPipeline {
     config: RankerConfig,
-    /// Cross-encoder for Stage 2 reranking (optional — loaded from HuggingFace)
-    reranker: Option<Arc<CrossEncoder>>,
-    /// NLI model for Stage 4 contradiction detection (optional)
-    nli_model: Option<Arc<CrossEncoder>>,
+    /// Cross-encoder for Stage 2 reranking (ONNX or Candle backend)
+    reranker: Option<Arc<Reranker>>,
+    /// NLI model for Stage 4 contradiction detection
+    nli_model: Option<Arc<Reranker>>,
+    /// Cache: (query_hash, doc_content_hash) -> cross-encoder score.
+    score_cache: dashmap::DashMap<(u64, u64), f32>,
 }
 
 /// Input document for the ranking pipeline.
@@ -43,33 +82,42 @@ pub struct RankCandidate {
 
 impl RankingPipeline {
     pub fn new(config: RankerConfig) -> Self {
-        // Try loading cross-encoder reranker
-        let reranker = match CrossEncoder::new("cross-encoder/ms-marco-MiniLM-L-6-v2") {
+        // Load reranker: try ONNX first (5-10x faster), fall back to Candle
+        let reranker = Self::load_reranker("cross-encoder/ms-marco-MiniLM-L-6-v2");
+
+        // Load NLI model: same priority — ONNX > Candle > None
+        let nli_model = Self::load_reranker("cross-encoder/nli-MiniLM2-L6-H768");
+
+        Self { config, reranker, nli_model, score_cache: dashmap::DashMap::new() }
+    }
+
+    /// Try loading a cross-encoder model. ONNX first (fast), Candle fallback.
+    fn load_reranker(model_id: &str) -> Option<Arc<Reranker>> {
+        // Try ONNX Runtime first — graph optimization gives 5-10x speedup
+        #[cfg(feature = "onnx")]
+        {
+            match web_search_embedder::onnx_cross_encoder::OnnxCrossEncoder::new(model_id) {
+                Ok(m) => {
+                    tracing::info!(model = m.model_id(), "ONNX reranker loaded");
+                    return Some(Arc::new(Reranker::Onnx(m)));
+                }
+                Err(e) => {
+                    tracing::info!("ONNX reranker unavailable for {model_id}, trying Candle: {e}");
+                }
+            }
+        }
+
+        // Candle fallback
+        match CrossEncoder::new(model_id) {
             Ok(m) => {
-                tracing::info!(model = m.model_id(), "Cross-encoder reranker loaded (Stage 2 active)");
-                Some(Arc::new(m))
+                tracing::info!(model = m.model_id(), "Candle reranker loaded");
+                Some(Arc::new(Reranker::Candle(m)))
             }
             Err(e) => {
-                tracing::warn!("Cross-encoder reranker unavailable, Stage 2 pass-through: {e}");
+                tracing::warn!("No reranker available for {model_id}: {e}");
                 None
             }
-        };
-
-        // Try loading NLI model — use MiniLM-based NLI (BERT-compatible architecture)
-        // DeBERTa v3 has disentangled attention incompatible with candle's BERT loader,
-        // so we use nli-MiniLM2-L6-H768 which shares architecture with our other models.
-        let nli_model = match CrossEncoder::new("cross-encoder/nli-MiniLM2-L6-H768") {
-            Ok(m) => {
-                tracing::info!(model = m.model_id(), "NLI model loaded (Stage 4 contradiction detection active)");
-                Some(Arc::new(m))
-            }
-            Err(e) => {
-                tracing::warn!("NLI model unavailable, Stage 4 using heuristic fallback: {e}");
-                None
-            }
-        };
-
-        Self { config, reranker, nli_model }
+        }
     }
 
     /// Run the full 5-stage pipeline on a set of candidates.
@@ -119,78 +167,98 @@ impl RankingPipeline {
 
         tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: ISR fusion");
 
-        // Stage 2: Cross-encoder rerank with early termination
+        // Stage 2: Cross-encoder rerank with score cache + early termination
         //
-        // Algorithm: Score candidates in batches sorted by ISR score (best first).
-        // After scoring top_k * 2 candidates, if the last batch's best score is
-        // below 50% of the running max, stop — remaining candidates are unlikely
-        // to overtake the leaders. Saves ~50% inference time on large candidate sets.
+        // Cache: (query_hash, doc_hash) → blended score. Skips inference on cache hit.
+        // Early termination: after scoring top_k*2, stop if batch scores drop below 50% of max.
         if let Some(reranker) = &self.reranker {
-            let early_term_min = (top_k * 2).max(10).min(scored.len());
+            let query_hash = hash_str(query);
+            let early_term_min = ((top_k * 3) / 2).max(10).min(scored.len());
             let batch_size = 8;
             let mut ce_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
             let mut max_ce_score = 0.0_f32;
             let mut terminated_early = false;
+            let mut cache_hits = 0_usize;
 
             for chunk_start in (0..scored.len()).step_by(batch_size) {
                 let chunk_end = (chunk_start + batch_size).min(scored.len());
                 let chunk = &scored[chunk_start..chunk_end];
 
-                let pairs: Vec<(&str, String)> = chunk.iter()
-                    .map(|(idx, _)| {
-                        let body = &candidates[*idx].body_text;
-                        let truncated: String = body.chars().take(512).collect();
-                        (query, truncated)
-                    })
-                    .collect();
+                // Separate cached vs uncached candidates
+                let mut need_inference: Vec<(usize, usize, String)> = Vec::new(); // (chunk_pos, global_idx, truncated)
+                for (ci, &(idx, isr_score)) in chunk.iter().enumerate() {
+                    let body = &candidates[idx].body_text;
+                    let truncated: String = body.chars().take(256).collect();
+                    let doc_hash = hash_str(&truncated);
+                    let cache_key = (query_hash, doc_hash);
 
-                let pair_refs: Vec<(&str, &str)> = pairs.iter()
-                    .map(|(q, d)| (*q, d.as_str()))
-                    .collect();
+                    if let Some(cached) = self.score_cache.get(&cache_key) {
+                        let blended = 0.3 * isr_score + 0.7 * *cached;
+                        ce_scores.push((idx, blended));
+                        max_ce_score = max_ce_score.max(*cached);
+                        cache_hits += 1;
+                    } else {
+                        need_inference.push((ci, idx, truncated));
+                    }
+                }
 
-                match reranker.score_pairs(&pair_refs) {
-                    Ok(scores) => {
-                        let mut batch_max = 0.0_f32;
-                        for (i, ce_score) in scores.iter().enumerate() {
-                            let global_i = chunk_start + i;
-                            if global_i < scored.len() {
-                                let blended = 0.3 * scored[global_i].1 + 0.7 * ce_score.score;
-                                ce_scores.push((scored[global_i].0, blended));
-                                batch_max = batch_max.max(ce_score.score);
-                                max_ce_score = max_ce_score.max(ce_score.score);
+                // Run cross-encoder only for cache misses
+                if !need_inference.is_empty() {
+                    let pairs: Vec<(&str, &str)> = need_inference.iter()
+                        .map(|(_, _, doc)| (query, doc.as_str()))
+                        .collect();
+
+                    match reranker.score_pairs(&pairs) {
+                        Ok(scores) => {
+                            let mut batch_max = 0.0_f32;
+                            for (i, ce_score) in scores.iter().enumerate() {
+                                if i >= need_inference.len() { break; }
+                                let (ci, idx, ref truncated) = need_inference[i];
+                                let global_i = chunk_start + ci;
+                                if global_i < scored.len() {
+                                    // Cache the raw CE score
+                                    let doc_hash = hash_str(truncated);
+                                    self.score_cache.insert((query_hash, doc_hash), ce_score.score);
+
+                                    let blended = 0.3 * scored[global_i].1 + 0.7 * ce_score.score;
+                                    ce_scores.push((idx, blended));
+                                    batch_max = batch_max.max(ce_score.score);
+                                    max_ce_score = max_ce_score.max(ce_score.score);
+                                }
+                            }
+
+                            if ce_scores.len() >= early_term_min && batch_max < max_ce_score * 0.6 {
+                                tracing::debug!(
+                                    scored = ce_scores.len(),
+                                    total = scored.len(),
+                                    "Stage 2: early termination"
+                                );
+                                terminated_early = true;
+                                break;
                             }
                         }
-
-                        // Early termination: if we've scored enough AND this batch is weak
-                        if ce_scores.len() >= early_term_min && batch_max < max_ce_score * 0.5 {
-                            tracing::debug!(
-                                scored = ce_scores.len(),
-                                total = scored.len(),
-                                "Stage 2: early termination — remaining candidates unlikely to improve"
-                            );
-                            terminated_early = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Cross-encoder batch failed: {e}");
-                        // Keep ISR scores for this batch
-                        for &(idx, isr) in chunk {
-                            ce_scores.push((idx, isr));
+                        Err(e) => {
+                            tracing::warn!("Cross-encoder batch failed: {e}");
+                            for &(ci, idx, _) in &need_inference {
+                                let global_i = chunk_start + ci;
+                                if global_i < scored.len() {
+                                    ce_scores.push((idx, scored[global_i].1));
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Replace scored with cross-encoder results
             scored = ce_scores;
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            if terminated_early {
-                tracing::debug!(scored = scored.len(), "Stage 2: cross-encoder with early termination");
-            } else {
-                tracing::debug!(scored = scored.len(), "Stage 2: cross-encoder full scoring");
-            }
+            tracing::debug!(
+                scored = scored.len(),
+                cache_hits,
+                early_term = terminated_early,
+                "Stage 2 complete"
+            );
         }
 
         let stage2_limit = self.config.rerank_top_k.min(scored.len());
@@ -382,7 +450,7 @@ impl RankingPipeline {
     /// Uses single batched `score_pairs` call instead of individual `classify_nli` calls.
     fn run_nli_checks(
         &self,
-        nli: &CrossEncoder,
+        nli: &Reranker,
         scored: &[(usize, f32)],
         candidates: &[RankCandidate],
     ) -> Vec<Contradiction> {
@@ -584,6 +652,13 @@ fn xquad_diversify(mut results: Vec<RankedResult>, query: &str) -> Vec<RankedRes
         }
     }
     diversified
+}
+
+/// Fast string hash for cache keys. Not cryptographic — just for deduplication.
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

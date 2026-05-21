@@ -5,7 +5,7 @@ pub mod snippet;
 pub mod trafilatura;
 pub mod consensus;
 
-pub use consensus::extract_page;
+pub use consensus::{extract_page, clean_body_text, is_serp_page};
 pub use snippet::extract_snippet;
 
 use chrono::{DateTime, Utc};

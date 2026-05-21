@@ -69,6 +69,9 @@ impl Fetcher {
             .cookie_store(true)
             .gzip(true)
             .brotli(true)
+            .pool_max_idle_per_host(20)
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(30))
             .default_headers(Self::default_headers())
             .build()
             .map_err(|e| Error::Crawl {

@@ -4,7 +4,6 @@ mod inner {
     use candle_nn::VarBuilder;
     use candle_transformers::models::bert::{BertModel, Config as BertConfig};
     use hf_hub::{api::sync::Api, Repo, RepoType};
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use tokenizers::Tokenizer;
     use web_search_common::{Error, Result};
@@ -13,7 +12,11 @@ mod inner {
     ///
     /// Used for:
     /// - Stage 2 reranking (ms-marco-MiniLM-L-6-v2)
-    /// - Stage 4 NLI contradiction detection (nli-deberta-v3-small)
+    /// - Stage 4 NLI contradiction detection (nli-MiniLM2-L6-H768)
+    ///
+    /// Architecture: BertModel encoder + linear classification head.
+    /// The classification head (classifier.weight, classifier.bias) is loaded
+    /// separately since candle's BertModel doesn't include it.
     pub struct CrossEncoder {
         model: Mutex<BertModel>,
         tokenizer: Tokenizer,
@@ -21,6 +24,10 @@ mod inner {
         model_id: String,
         max_seq_len: usize,
         num_labels: usize,
+        /// Classification head: weight matrix [num_labels, hidden_size]
+        classifier_weight: Tensor,
+        /// Classification head: bias vector [num_labels]
+        classifier_bias: Tensor,
         /// Label index mapping for NLI: label_name → index
         id2label: std::collections::HashMap<usize, String>,
     }
@@ -112,14 +119,43 @@ mod inner {
                     .map_err(|e| Error::Embedding(format!("load pytorch weights: {e}")))?
             };
 
+            // Clone VarBuilder before BertModel consumes it — we need it
+            // to load the classification head weights separately.
+            let vb_head = vb.clone();
+
             let model = BertModel::load(vb, &bert_config)
                 .map_err(|e| Error::Embedding(format!("load model: {e}")))?;
+
+            // Load classification head: classifier.weight [num_labels, hidden_size]
+            // and classifier.bias [num_labels]. These are NOT part of candle's BertModel.
+            let hidden_size = bert_config.hidden_size;
+            let (classifier_weight, classifier_bias) = match (
+                vb_head.get((num_labels, hidden_size), "classifier.weight"),
+                vb_head.get(num_labels, "classifier.bias"),
+            ) {
+                (Ok(w), Ok(b)) => {
+                    tracing::info!("Classification head loaded: [{num_labels}, {hidden_size}]");
+                    (w, b)
+                }
+                _ => {
+                    // Fallback: random init (should not happen with proper model files)
+                    tracing::warn!(
+                        "Classification head not found in weights — scores will be degraded. \
+                         Expected classifier.weight [{num_labels}, {hidden_size}] and classifier.bias [{num_labels}]"
+                    );
+                    let w = Tensor::randn(0f32, 0.02, (num_labels, hidden_size), &device)
+                        .map_err(|e| Error::Embedding(format!("init classifier weight: {e}")))?;
+                    let b = Tensor::zeros(num_labels, DType::F32, &device)
+                        .map_err(|e| Error::Embedding(format!("init classifier bias: {e}")))?;
+                    (w, b)
+                }
+            };
 
             tracing::info!(
                 model = model_id,
                 num_labels,
                 max_seq = bert_config.max_position_embeddings,
-                "Cross-encoder loaded"
+                "Cross-encoder loaded with classification head"
             );
 
             Ok(Self {
@@ -129,6 +165,8 @@ mod inner {
                 model_id: model_id.to_string(),
                 max_seq_len: bert_config.max_position_embeddings,
                 num_labels,
+                classifier_weight,
+                classifier_bias,
                 id2label,
             })
         }
@@ -189,38 +227,39 @@ mod inner {
             let output = model.forward(&input_ids_t, &token_type_ids_t, None)
                 .map_err(|e| Error::Embedding(format!("forward: {e}")))?;
 
-            // Extract [CLS] token embeddings (first token of each sequence)
-            // For cross-encoders, the pooled output or CLS embedding is used
-            // We take the first token's hidden state
+            // Extract [CLS] token hidden state: [batch, hidden_size]
             let cls_output = output
                 .narrow(1, 0, 1)
                 .and_then(|t| t.squeeze(1))
                 .map_err(|e| Error::Embedding(format!("cls extract: {e}")))?;
 
+            // Apply classification head: logits = cls @ weight^T + bias
+            // cls_output: [batch, hidden_size], weight: [num_labels, hidden_size]
+            // Result: [batch, num_labels]
+            let weight_t = self.classifier_weight.t()
+                .map_err(|e| Error::Embedding(format!("transpose classifier weight: {e}")))?;
+            let logits_tensor = cls_output
+                .matmul(&weight_t)
+                .and_then(|t| t.broadcast_add(&self.classifier_bias))
+                .map_err(|e| Error::Embedding(format!("classifier head: {e}")))?;
+
             // Convert to scores
             let mut results = Vec::with_capacity(batch_size);
             for i in 0..batch_size {
-                let hidden = cls_output.get(i)
+                let logits: Vec<f32> = logits_tensor.get(i)
                     .and_then(|t| t.to_vec1::<f32>())
                     .unwrap_or_else(|_| vec![0.0; self.num_labels]);
 
-                // For reranking (1 label): use mean of hidden state as score
-                // For NLI (3 labels): hidden state is larger, take first 3 as logits proxy
                 let score = if self.num_labels == 1 {
-                    // Reranking: mean pooled score
-                    let mean: f32 = hidden.iter().sum::<f32>() / hidden.len() as f32;
-                    sigmoid(mean)
+                    // Reranking: single logit → sigmoid
+                    sigmoid(logits[0])
                 } else {
-                    // NLI: take first 3 values, softmax
-                    let logits: Vec<f32> = hidden.iter().take(3).copied().collect();
+                    // NLI: softmax → entailment probability
                     let sm = softmax(&logits);
-                    sm.get(2).copied().unwrap_or(0.0) // entailment probability
+                    sm.get(2).copied().unwrap_or(0.0)
                 };
 
-                results.push(CrossEncoderScore {
-                    logits: hidden.iter().take(self.num_labels.max(3)).copied().collect(),
-                    score,
-                });
+                results.push(CrossEncoderScore { logits, score });
             }
 
             Ok(results)

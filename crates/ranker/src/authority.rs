@@ -50,42 +50,89 @@ fn is_tier1_domain(d: &str) -> bool {
         // Academic journals & publishers
         "nature.com", "science.org", "sciencedirect.com", "springer.com",
         "thelancet.com", "bmj.com", "nejm.org", "cell.com", "pnas.org",
-        "arxiv.org", "pubmed.ncbi.nlm.nih.gov",
+        "arxiv.org", "pubmed.ncbi.nlm.nih.gov", "scholar.google.com",
+        "jstor.org", "wiley.com", "tandfonline.com", "oup.com",
+        "cambridge.org", "sagepub.com", "ssrn.com", "researchgate.net",
         // Standards bodies & professional orgs
-        "w3.org", "ietf.org", "ieee.org", "acm.org",
+        "w3.org", "ietf.org", "ieee.org", "acm.org", "iso.org",
         // Government & intergovernmental
         "who.int", "nasa.gov", "nist.gov", "worldbank.org",
         "cdc.gov", "nih.gov", "fda.gov", "epa.gov", "sec.gov",
-        "un.org", "europa.eu",
+        "un.org", "europa.eu", "imf.org", "oecd.org",
+        "data.gov", "census.gov", "bls.gov", "usda.gov",
+        "energy.gov", "defense.gov", "state.gov",
     ];
     tier1.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))
 }
 
 fn is_tier2_domain(d: &str) -> bool {
     let tier2 = [
+        // Major news organizations
         "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
         "nytimes.com", "washingtonpost.com", "theguardian.com",
         "npr.org", "cnn.com", "cnbc.com", "forbes.com",
-        "news.google.com", "news.yahoo.com",
+        "bloomberg.com", "ft.com", "economist.com", "wsj.com",
+        "usatoday.com", "latimes.com", "theatlantic.com",
+        "politico.com", "axios.com", "time.com", "newsweek.com",
+        "news.google.com", "news.yahoo.com", "abcnews.go.com",
+        "nbcnews.com", "cbsnews.com", "foxnews.com",
+        // Tech news & industry
+        "techcrunch.com", "theverge.com", "arstechnica.com",
+        "wired.com", "zdnet.com", "cnet.com", "engadget.com",
+        "anandtech.com", "tomshardware.com", "servethehome.com",
+        "theregister.com", "infoworld.com", "computerworld.com",
+        // Business & finance
+        "fortune.com", "businessinsider.com", "hbr.org",
+        "investopedia.com", "marketwatch.com", "seekingalpha.com",
+        // Official documentation
         "docs.python.org", "docs.rs", "doc.rust-lang.org",
         "developer.mozilla.org", "developer.apple.com",
-        "learn.microsoft.com", "cloud.google.com",
+        "developer.android.com", "developers.google.com",
+        "learn.microsoft.com", "cloud.google.com", "aws.amazon.com",
+        "docs.aws.amazon.com", "azure.microsoft.com",
+        "docs.oracle.com", "docs.docker.com", "kubernetes.io",
+        "react.dev", "vuejs.org", "angular.io", "nextjs.org",
+        "nodejs.org", "go.dev", "www.typescriptlang.org",
+        // Reference & encyclopedias
         "en.wikipedia.org", "wikipedia.org",
-        "stackoverflow.com",
-        "github.com", "docs.github.com",
-        "cppreference.com", "man7.org",
-        "wikidata.org", "wikimedia.org",
+        "wikidata.org", "wikimedia.org", "britannica.com",
+        // Developer platforms
+        "stackoverflow.com", "github.com", "docs.github.com",
+        "gitlab.com", "cppreference.com", "man7.org",
+        // Tech companies (official)
+        "openai.com", "anthropic.com", "deepmind.google",
+        "ai.meta.com", "nvidia.com", "developer.nvidia.com",
+        "intel.com", "amd.com", "qualcomm.com",
+        "apple.com", "microsoft.com", "google.com",
+        // Health & science
+        "mayoclinic.org", "webmd.com", "healthline.com",
+        "sciencedaily.com", "newscientist.com", "livescience.com",
+        "phys.org", "scientificamerican.com",
     ];
     tier2.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))
 }
 
 fn is_tier3_domain(d: &str) -> bool {
     let tier3 = [
-        "medium.com", "dev.to", "reddit.com", "old.reddit.com",
-        "quora.com", "news.ycombinator.com",
-        "hashnode.dev", "substack.com",
-        "wordpress.com", "blogspot.com",
-        "tumblr.com", "stackexchange.com",
+        // Developer blogs & communities
+        "medium.com", "dev.to", "hashnode.dev", "substack.com",
+        "dzone.com", "baeldung.com", "freecodecamp.org",
+        "css-tricks.com", "smashingmagazine.com",
+        "digitalocean.com", "tutorialspoint.com",
+        "geeksforgeeks.org", "w3schools.com",
+        // Social & forums
+        "reddit.com", "old.reddit.com", "news.ycombinator.com",
+        "quora.com", "stackexchange.com", "lobste.rs",
+        "slashdot.org", "discourse.org",
+        // Blog platforms
+        "wordpress.com", "blogspot.com", "tumblr.com",
+        "ghost.org", "notion.site",
+        // Tech analysis
+        "techtarget.com", "techrepublic.com", "pcmag.com",
+        "howtogeek.com", "makeuseof.com", "lifehacker.com",
+        // Niche credible
+        "statista.com", "kaggle.com", "huggingface.co",
+        "paperswithcode.com", "distill.pub",
     ];
     tier3.iter().any(|t| d == *t || d.ends_with(&format!(".{t}")))
 }

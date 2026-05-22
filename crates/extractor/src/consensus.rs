@@ -173,7 +173,7 @@ pub fn to_page(
 
 // ── Data Quality Filters ─────────────────────────────────────────────
 
-/// Public filter: remove code blocks, CTAs, navigation, and fix unicode.
+/// Public filter: remove code blocks, CTAs, navigation, citations, and fix unicode.
 /// Call on body_text after extraction to clean up non-factual content.
 pub fn clean_body_text(text: &str) -> String {
     let cleaned: String = text
@@ -181,6 +181,9 @@ pub fn clean_body_text(text: &str) -> String {
         .filter(|line| !is_code_line(line))
         .filter(|line| !is_cta_line(line))
         .filter(|line| !is_navigation_line(line))
+        .filter(|line| !is_citation_footnote_line(line))
+        .filter(|line| !is_retrieved_or_archived_line(line))
+        .map(|line| strip_reference_brackets(line))
         .collect::<Vec<_>>()
         .join("\n");
     normalize_unicode(&cleaned)
@@ -266,6 +269,175 @@ fn is_navigation_line(line: &str) -> bool {
     if trimmed.contains(" > ") && trimmed.split(" > ").count() >= 3 {
         return true;
     }
+    false
+}
+
+/// Detect Wikipedia citation/footnote lines like "^ a b c Brandom, Russell..."
+fn is_citation_footnote_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    // Lines starting with "^" followed by spaces and single letters (footnote back-references)
+    // e.g. "^ a b c Brandom, Russell (March 5, 2026)..."
+    if trimmed.starts_with('^') {
+        let rest = trimmed[1..].trim_start();
+        // Check if it starts with single-letter markers like "a b c" or is a footnote body
+        if rest.is_empty() {
+            return true;
+        }
+        // Pattern: "^ a b c ..." — single letters separated by spaces
+        let mut chars = rest.chars();
+        if let Some(first) = chars.next() {
+            if first.is_ascii_alphabetic() {
+                // Next char is space or end — it's a footnote marker line
+                match chars.next() {
+                    None => return true,
+                    Some(' ') => return true,
+                    _ => {}
+                }
+            }
+        }
+        // Also catch lines like "^ Brandom, Russell" or "^ \"Title of article\""
+        // These are citation/reference lines starting with ^
+        if rest.chars().next().map_or(false, |c| c.is_ascii_uppercase() || c == '"' || c == '\'') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect "Retrieved [Month] [Day], [Year]" and "Archived from the original on..." lines.
+fn is_retrieved_or_archived_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_lowercase();
+
+    // "Retrieved January 5, 2026" or "Retrieved 2026-01-05" or ". Retrieved ..."
+    if lower.contains("retrieved ") {
+        let months = [
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        ];
+        // Check for "retrieved <Month>" pattern
+        if let Some(pos) = lower.find("retrieved ") {
+            let after = &lower[pos + 10..];
+            let after_trimmed = after.trim_start();
+            // Matches "retrieved January ..." or "retrieved 2" (year start)
+            if months.iter().any(|m| after_trimmed.starts_with(m)) {
+                return true;
+            }
+            // Matches "retrieved 2026-..." or "retrieved 20..."
+            if after_trimmed.starts_with("20") || after_trimmed.starts_with("19") {
+                return true;
+            }
+        }
+    }
+
+    // "Archived from the original on ..."
+    if lower.contains("archived from the original") {
+        return true;
+    }
+    // Also match "Archived (PDF) from the original" etc.
+    if lower.contains("archived") && lower.contains("from the original") {
+        return true;
+    }
+
+    false
+}
+
+/// Strip reference bracket markers like [1], [2], [citation needed], [edit] from a line.
+fn strip_reference_brackets(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            // Collect the content inside brackets
+            let mut bracket_content = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == ']' {
+                    found_close = true;
+                    break;
+                }
+                bracket_content.push(inner);
+            }
+
+            if !found_close {
+                // No closing bracket — keep the original text
+                result.push('[');
+                result.push_str(&bracket_content);
+            } else if should_strip_bracket(&bracket_content) {
+                // Strip this bracket entirely (don't add anything)
+            } else {
+                // Keep brackets that look like meaningful content (e.g., [example])
+                result.push('[');
+                result.push_str(&bracket_content);
+                result.push(']');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Determine if a bracket's content should be stripped (reference markers, editorial tags).
+fn should_strip_bracket(content: &str) -> bool {
+    let trimmed = content.trim();
+
+    // Empty brackets
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Pure numeric references: [1], [23], [145]
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    // Numeric ranges or lists: [1][2], already split by caller, but handle [1,2] or [1-3]
+    if trimmed.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '-' || c == ' ') {
+        return true;
+    }
+
+    // Common editorial/Wikipedia markers
+    let lower = trimmed.to_lowercase();
+    let editorial_markers = [
+        "citation needed",
+        "edit",
+        "note",
+        "nb",
+        "clarification needed",
+        "when?",
+        "who?",
+        "where?",
+        "which?",
+        "what?",
+        "why?",
+        "how?",
+        "dubious",
+        "discuss",
+        "disputed",
+        "unreliable source",
+        "unreliable source?",
+        "better source needed",
+        "failed verification",
+        "not in citation given",
+        "original research?",
+        "primary source needed",
+        "year needed",
+        "page needed",
+        "full citation needed",
+        "dead link",
+        "permanent dead link",
+        "self-published source",
+        "self-published source?",
+        "update",
+        "needs update",
+    ];
+    if editorial_markers.iter().any(|m| lower == *m) {
+        return true;
+    }
+
     false
 }
 

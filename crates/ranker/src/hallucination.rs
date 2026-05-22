@@ -42,7 +42,7 @@ pub fn check_hallucination(docs: &[DocClaims], min_orgs: usize) -> Hallucination
     }
 
     // Cross-reference: count how many documents mention each key phrase
-    // Uses fuzzy matching: phrases that share 60%+ words are considered the same claim
+    // Uses fuzzy matching: phrases that share 40%+ words are considered the same claim
     let mut phrase_sources: HashMap<String, Vec<String>> = HashMap::new();
     let all_phrases: Vec<(String, String)> = docs.iter()
         .flat_map(|doc| {
@@ -74,8 +74,8 @@ pub fn check_hallucination(docs: &[DocClaims], min_orgs: usize) -> Hallucination
             let max_len = phrase_words.len().max(existing_words.len());
             let overlap_ratio = overlap as f32 / max_len as f32;
 
-            // 60%+ word overlap → same claim
-            if overlap_ratio >= 0.6 && !sources.contains(url) {
+            // 40%+ word overlap → same claim
+            if overlap_ratio >= 0.4 && !sources.contains(url) {
                 sources.push(url.clone());
             }
         }
@@ -186,8 +186,8 @@ fn extract_number_claims(
             let words: Vec<&str> = phrase.split_whitespace().collect();
             for (i, word) in words.iter().enumerate() {
                 if let Ok(num) = word.replace(',', "").replace('%', "").parse::<f64>() {
-                    // Use surrounding context as topic key
-                    let start = i.saturating_sub(3);
+                    // Use surrounding context as topic key (5 words for better disambiguation)
+                    let start = i.saturating_sub(5);
                     let _end = (i + 1).min(words.len());
                     let context = words[start..i].join(" ");
                     let unit = if word.ends_with('%') {
@@ -198,7 +198,9 @@ fn extract_number_claims(
                         String::new()
                     };
 
-                    if !context.is_empty() {
+                    // Require at least 3 context words to avoid false matches
+                    let context_word_count = context.split_whitespace().count();
+                    if context_word_count >= 3 {
                         number_claims
                             .entry((context, unit))
                             .or_default()

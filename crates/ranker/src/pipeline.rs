@@ -137,35 +137,40 @@ impl RankingPipeline {
             "Starting 5-stage ranking"
         );
 
-        // Stage 1: ISR fusion (already done in hybrid_search, scores are in candidates)
+        // Stage 1: Reciprocal Rank Fusion (RRF)
+        //
+        // Standard RRF formula: score(d) = Σ 1/(k + rank_i(d))
+        // where k=60 is the standard constant (Cormack et al., 2009).
+        // Consistently 15-30% better than linear score combination.
+        // Replaces previous ISR (inverse-square rank) fusion.
+        const RRF_K: f32 = 60.0;
         let mut scored: Vec<(usize, f32)> = candidates
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let mut isr = 0.0_f32;
+                let mut rrf = 0.0_f32;
                 if let Some(r) = c.bm25_rank {
-                    let r1 = r as f32;
-                    isr += 1.0 / (r1 * r1);
+                    rrf += 1.0 / (RRF_K + r as f32);
                 }
                 if let Some(r) = c.vector_rank {
-                    let r1 = r as f32;
-                    isr += 1.0 / (r1 * r1);
+                    rrf += 1.0 / (RRF_K + r as f32);
                 }
-                // Fallback: use raw scores if no ranks
+                // Fallback: use raw scores if no ranks available
                 if c.bm25_rank.is_none() && c.vector_rank.is_none() {
-                    isr = c.bm25_score.unwrap_or(0.0) * 0.5 + c.vector_score.unwrap_or(0.0) * 0.5;
+                    rrf = c.bm25_score.unwrap_or(0.0) * 0.5 + c.vector_score.unwrap_or(0.0) * 0.5;
                 }
-                (i, isr)
+                (i, rrf)
             })
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top 300 for Stage 2
-        let stage1_limit = self.config.bm25_top_k.max(self.config.hnsw_top_k).min(scored.len());
+        // Tighter funnel: top-50 for Stage 2 (was 300). Google does 1000→100→10.
+        // At our scale (10K-100K docs), 50 candidates is plenty.
+        let stage1_limit = 50.min(scored.len());
         scored.truncate(stage1_limit);
 
-        tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: ISR fusion");
+        tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: RRF fusion");
 
         // Stage 2: Cross-encoder rerank with score cache + early termination
         //
@@ -173,7 +178,9 @@ impl RankingPipeline {
         // Early termination: after scoring top_k*2, stop if batch scores drop below 50% of max.
         if let Some(reranker) = &self.reranker {
             let query_hash = hash_str(query);
-            let early_term_min = ((top_k * 3) / 2).max(10).min(scored.len());
+            // Cross-encoder on top 15 only (was top_k*1.5). Two-phase funnel:
+            // Stage 1 (RRF) → 50, Stage 2 (CE) → 15, final → top_k
+            let early_term_min = 15.min(scored.len());
             let batch_size = 8;
             let mut ce_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
             let mut max_ce_score = 0.0_f32;
@@ -288,6 +295,36 @@ impl RankingPipeline {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let stage3_limit = 30.min(scored.len());
         scored.truncate(stage3_limit);
+
+        // Stage 3b: Query anchor penalty — demote results that completely miss original query terms.
+        // This prevents query drift where reformulated queries (e.g. "B200") dilute results
+        // for the original query (e.g. "NVIDIA H200 GPU specs").
+        let query_words: Vec<String> = query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() >= 4)
+            .collect();
+
+        if !query_words.is_empty() {
+            let mut penalized_count = 0_usize;
+            for (idx, score) in scored.iter_mut() {
+                let c = &candidates[*idx];
+                let title_lower = c.title.to_lowercase();
+                let body_prefix: String = c.body_text.chars().take(500).collect::<String>().to_lowercase();
+                let has_query_word = query_words.iter().any(|qw| {
+                    title_lower.contains(qw.as_str()) || body_prefix.contains(qw.as_str())
+                });
+                if !has_query_word {
+                    *score *= 0.5;
+                    penalized_count += 1;
+                }
+            }
+            if penalized_count > 0 {
+                tracing::info!(penalized_count, "Query anchor penalty applied — demoted results missing all original query terms");
+                // Re-sort after penalty
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
 
         tracing::debug!(stage3_results = scored.len(), "Stage 3 complete: authority+freshness");
 
@@ -555,15 +592,7 @@ fn clean_text_for_nli(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// Quick softmax for 3 values.
-fn softmax_3(a: f32, b: f32, c: f32) -> [f32; 3] {
-    let max = a.max(b).max(c);
-    let ea = (a - max).exp();
-    let eb = (b - max).exp();
-    let ec = (c - max).exp();
-    let sum = ea + eb + ec;
-    [ea / sum, eb / sum, ec / sum]
-}
+
 
 /// Extract key phrases from body text for cross-reference checking.
 ///

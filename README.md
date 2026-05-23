@@ -1,88 +1,84 @@
 # Web Search MCP Server
 
-A self-contained, API-free web search engine built in Rust that runs as an MCP (Model Context Protocol) server. Crawls, indexes, and ranks web content directly — no Google API, no Bing API, no external search dependencies. Uses neural ML models for semantic understanding, cross-encoder reranking, and NLI-based contradiction detection to provide verified, grounded results that prevent LLM hallucination.
+A self-contained, API-free web search engine built in Rust that runs as an MCP (Model Context Protocol) server. Crawls, indexes, and ranks web content directly — no Google API, no Bing API, no external search dependencies. Uses neural ML models for semantic understanding, cross-encoder reranking, ColBERT late-interaction scoring, and NLI-based contradiction detection to provide verified, grounded results that prevent LLM hallucination.
 
 ## What It Does
 
-- **Crawls the web directly** — no search API keys needed, parses 13 search engines (Google, Bing, Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed, SearXNG metasearch x2)
-- **SearXNG metasearch** — aggregates Google/Bing/DDG results via JSON API without CAPTCHA, bypasses JS-rendering limitations
+- **SearXNG metasearch (primary)** — self-hosted or public SearXNG aggregates Google/Bing/DDG via JSON API without CAPTCHA. Configurable via `searxng_url` in config. `docker run -d -p 8080:8080 searxng/searxng` for instant setup
+- **Crawls the web directly** — fallback to 13 search engine parsers (Google, Bing, Brave, Mojeek, DuckDuckGo, Wikipedia, ArXiv, Reddit, HN, Google Scholar, PubMed) when SearXNG unavailable
+- **ColBERT late-interaction reranking** — mxbai-edge-colbert-v0-17m (48-dim, INT8 ONNX) replaces slow cross-encoder for Stage 2. MaxSim scoring: ~5-10ms for 50 docs vs ~8s with cross-encoder (160-400x speedup). Feature-gated (`--features onnx`)
+- **SPLADE sparse retrieval** — semantic term expansion via Splade_PP_en_v1 ONNX. Augments BM25 with vocabulary-level relevance weights. Feature-gated (`--features onnx`)
+- **Persistent disk cache (redb)** — embeddings + cross-encoder scores survive restarts. Pure-Rust embedded KV store, write-behind flush every 30s, TTL-based eviction
+- **Background crawl daemon** — pre-indexes content before queries arrive. Priority queue with domain-level backoff, populates URL cache from discovered links
+- **Streaming search pipeline** — progressive results: partial at 3s (fast extraction), refined at 10s (full ranking pipeline). Two-tier deadline via mpsc channels
+- **Index-first retrieval** — searches persistent Tantivy + HNSW index before crawling. If fresh results exist (<24h), returns instantly — no crawl needed
+- **Query-term relevance gate** — Stage 0 filter rejects candidates with <30% distinctive query-term overlap before expensive CE/ColBERT scoring. Prevents irrelevant pages from polluting results
+- **Primary source boost** — 200+ entity-to-domain mappings (AI, GPU, cloud, languages, frameworks). Official domains boosted up to 4.5x (2.5x domain-in-query x 1.8x canonical)
+- **Semantic query cache** — caches results by query embedding similarity (cosine > 0.92 = cache hit). Similar queries return instantly (<1s). 4-hour TTL
 - **HTTP response caching** — LRU cache (moka) with 10-minute TTL avoids re-fetching, captures ETag/Last-Modified for conditional requests
 - **FuturesUnordered streaming crawler** — processes pages as they arrive (no head-of-line blocking), 8-16 concurrent workers
 - **Headless browser fallback** — optional chromiumoxide integration for JS-rendered pages (SPA detection triggers automatic browser rendering)
 - **Extracts clean content** — parallel 2-pass consensus extraction (Readability + Trafilatura via rayon) with CSS/JS sanitization
 - **Batch embeddings** — two-phase processing: extract+index (no ML), then single batched embed() call for all pages at once
-- **Query-focused MMR + TextRank synthesis** — hybrid summarization: TextRank graph scoring + query-biased MMR selection (λ*query_relevance + (1-λ)*importance - diversity_penalty). Outperforms pure TF-IDF or pure TextRank
-- **Index-first retrieval** — searches persistent Tantivy + HNSW index before crawling. If fresh results exist (<24h), returns instantly — no crawl needed. Eliminates 44% of query latency on repeat/similar queries
-- **Semantic query cache** — caches results by query embedding similarity (cosine > 0.92 = cache hit). Similar queries return instantly (<1s). 4-hour TTL, max 200 entries
-- **ONNX Runtime cross-encoder** — optional ONNX backend with INT8 quantized models (23MB vs 91MB). 5-10x faster than Candle FP32. Feature-gated, auto-downloads quantized model from HuggingFace
-- **Early termination ranking** — cross-encoder scores top-15 candidates only (was 300); stops when batch scores drop below 60% of running max
-- **xQuAD result diversification** — post-ranking subtopic coverage: extracts key bigrams per result, greedily reorders to maximize unique subtopic coverage
-- **URL relevance prediction** — scores URLs before fetching using anchor text + path token overlap with query. Skips irrelevant pages, improves harvest rate
-- **Language detection** — auto-detects page language from HTML attributes or text analysis (11 languages: en, zh, ja, ko, ar, ru, hi, es, fr, de, pt)
+- **Query-focused MMR + TextRank synthesis** — hybrid summarization: TextRank graph scoring + query-biased MMR selection
+- **ONNX Runtime cross-encoder** — optional ONNX backend with INT8 quantized models. 5-10x faster than Candle FP32. Feature-gated
+- **Cross-encoder with pooler** — properly loads BERT pooler layer (tanh(dense(cls))) + classification head. Supports both single-linear (ms-marco) and MLP (NLI) architectures
+- **NLI contradiction detection** — nli-MiniLM2-L6-H768 with two-layer MLP classification head (dense + out_proj). Classifies claim pairs as entailment/contradiction/neutral
+- **5-stage anti-hallucination pipeline** — query-term gate, RRF fusion, ColBERT/CE rerank, authority scoring with primary source boost, NLI contradiction detection, xQuAD diversity
 - **Neural embeddings** — all-MiniLM-L6-v2 via Candle (pure Rust, no Python) for semantic search, with content-hash embedding cache
-- **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 with proper classification head (classifier.weight/bias projection). Score cache avoids re-scoring repeated query+doc pairs
-- **NLI contradiction detection** — nli-MiniLM2-L6-H768 classifies claim pairs as entailment/contradiction/neutral
-- **5-stage anti-hallucination pipeline** — RRF fusion, cross-encoder rerank (top-15), authority scoring with query anchor, NLI contradiction detection, xQuAD diversity
-- **URL result cache** — DashMap with 4-hour TTL, 500 URL cap. Skips re-crawling + re-extracting same URLs across queries
-- **Language filter** — skips non-English pages using HTML lang attribute + stop-word heuristic. Prevents Somali/Turkish/Tagalog Wikipedia from polluting English results
-- **Citation stripping** — removes Wikipedia footnotes (`^ a b c`), reference brackets (`[1][2]`), "Retrieved/Archived" dates from content
-- **Persistent storage** — tantivy index + HNSW vectors (bincode binary format) + dedup state with TTL survive across sessions
-- **Dedup with TTL** — URL entries expire after 1 hour (content hashes permanent), enables re-crawl of updated content
-- **Index staleness tracking** — documents stamped with `indexed_at`, search results warn when content is >24h old
-- **Smart frontier** — composite priority scoring: depth + domain authority bonus (Tier1 sites prioritized) + diversity factor
-- **Query reformulation** — 40+ synonym pairs, domain-specific expansion (medical, scientific, news, technical), question variant generation
-- **Enhanced NER** — regex-based extraction of emails, URLs, dates, money, percentages, phone numbers plus capitalized phrase detection
-- **Progress notifications** — broadcast channel reports 5-stage progress during deep_research for MCP-aware clients
-- **Parser health monitoring** — detects when search engine parsers return 0 results from content-rich pages, logs warnings for outdated parsers
+- **Persistent storage** — tantivy index + HNSW vectors + redb cache + dedup state with TTL survive across sessions
 - **Works with any LLM** — standard MCP protocol over stdio
 
 ## Architecture
 
+![Architecture](images/Gemini_Generated_Image_ogs7ssogs7ssogs7.png)
+
 ```
-                         MCP Server (stdio, concurrent)
-                         Progress Notifications
+                         MCP Server (stdio, 15 tools)
+                         Progress + Streaming Events
                               |
                          Orchestrator
-                    /     |     |     \
-              Crawler   Extractor  Indexer    Ranker
-                 |         |         |          |
-           Streaming    Parallel   Tantivy   5-Stage Pipeline
-           Futures      2-Pass     HNSW      Cross-Encoder
-           Unordered    (rayon)    SimHash    NLI Contradictions
-           LRU Cache    CSS/JS     Dedup     Authority+Freshness
-           13 Search    Sanitize   Bincode    MMR Diversity
-           Engines      Language   TTL           |
-           SearXNG      TextRank   Persist    Embedder
-           Browser      NER          |        Batch Embed
-           Fallback     Metadata   Staleness  MiniLM-L6 (Candle)
-           Robots.txt   Chunker    Tracking
-           Pagination
+                    /     |     |     \        \
+              Crawler   Extractor  Indexer    Ranker      Daemon
+                 |         |         |          |           |
+           Streaming    Parallel   Tantivy   6-Stage     Background
+           Futures      2-Pass     HNSW      Pipeline    Crawl Queue
+           Unordered    (rayon)    SimHash    ColBERT     Priority
+           LRU Cache    CSS/JS     Dedup     Cross-Enc   Domain Backoff
+           SearXNG      Sanitize   redb      NLI         Pre-index
+           13 Search    Language   Persist   Authority      |
+           Engines      TextRank   SPLADE    Diversity   Embedder
+           Browser      NER        TTL       Gate        Batch Embed
+           Fallback     Metadata   Staleness Primary     MiniLM-L6
+           Robots.txt   Chunker    Tracking  Source      SPLADE
+           Pagination                                    ColBERT
 ```
 
 ### 8 Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `common` | Data models, config, errors, logging |
-| `crawler` | FuturesUnordered streaming crawler (8-16 workers), LRU response cache, 13 search engine parsers (incl. SearXNG), browser fallback (chromiumoxide), parser health monitoring, SPA detection, robots.txt, rate limiting, pagination, sitemap |
+| `common` | Data models, config (incl. `searxng_url`), errors, logging |
+| `crawler` | FuturesUnordered streaming crawler (8-16 workers), LRU response cache, 13 search engine parsers (incl. SearXNG localhost detection), browser fallback, parser health monitoring, SPA detection, robots.txt, rate limiting, pagination |
 | `extractor` | Parallel 2-pass extraction (rayon), CSS/JS sanitization, language detection (11 languages), metadata, JSON-LD, tables, snippet extraction, chunking |
-| `indexer` | Tantivy full-text (disk-backed) + HNSW vectors (bincode binary format) + SimHash/dedup with TTL (1-hour URL expiry) + staleness tracking |
-| `embedder` | CandleEmbedder (neural, batch embed) + HashEmbedder (fallback) + CrossEncoder (reranking + NLI) |
-| `ranker` | 5-stage anti-hallucination ranking pipeline with ML models |
-| `orchestrator` | Two-phase batch processing (extract → batch embed), TextRank graph synthesis, 40+ synonym query reformulation, domain-specific expansion, enhanced regex NER, progress broadcasting |
-| `mcp-server` | MCP protocol layer with 13 tool definitions, concurrent tool calls, progress logging |
+| `indexer` | Tantivy full-text with SPLADE `splade_body` field (disk-backed) + HNSW vectors (bincode) + SimHash/dedup with TTL + staleness tracking |
+| `embedder` | CandleEmbedder (neural, batch embed) + HashEmbedder (fallback) + CrossEncoder (reranking with pooler + MLP head) + ColBERT (MaxSim, ONNX) + SPLADE (sparse, ONNX) |
+| `ranker` | 6-stage anti-hallucination ranking pipeline with ML models, 200+ entity-domain mappings, primary source boost |
+| `orchestrator` | Batch processing, TextRank synthesis, query reformulation, persistent cache (redb), background crawl daemon, streaming pipeline, progress broadcasting |
+| `mcp-server` | MCP protocol layer with 15 tool definitions, concurrent tool calls, daemon startup, shutdown flush |
 
-## 14 MCP Tools
+## 15 MCP Tools
 
 ### Smart Tools (high-level research)
 
 | Tool | Description |
 |------|-------------|
 | `instant_search` | Ultra-fast search (~1-2s). SearXNG + BM25 ranking, skips cross-encoder entirely. Best for simple factual queries |
-| `deep_research` | Multi-wave crawl across hundreds of pages with 5-stage progress reporting. Query reformulation with 40+ synonyms and domain-specific expansion. Follows search result links, pagination. Returns verified results with confidence scores, claim attribution, and NLI-based contradiction detection |
-| `quick_search` | Adaptive search (5-15s). Adjusts crawl budget by query type: factual (10 pages, 5s) → research (30 pages, 12s). Index-first: skips crawl if fresh results exist |
+| `streaming_search` | Progressive results: partial at ~3s (fast extraction), refined at ~10s (full ranking pipeline). Best when you want results ASAP |
+| `deep_research` | Multi-wave crawl across hundreds of pages with progress reporting. Returns verified results with confidence scores, claim attribution, and NLI-based contradiction detection |
+| `quick_search` | Adaptive search (5-15s). Adjusts crawl budget by query type: factual (10 pages, 5s) to research (30 pages, 12s). Index-first: skips crawl if fresh results exist |
 | `explore_topic` | Discovery mode — broadly explores a topic, builds entity connections |
-| `verify_claim` | Fact-checking — searches for evidence supporting or contradicting a claim. Reports source diversity and contradiction severity |
+| `verify_claim` | Fact-checking — searches for evidence supporting or contradicting a claim |
 | `compare_sources` | Side-by-side content comparison from multiple URLs on a specific aspect |
 
 ### Atomic Tools (fine-grained control)
@@ -92,49 +88,53 @@ A self-contained, API-free web search engine built in Rust that runs as an MCP (
 | `fetch_page` | Fetch raw content from a URL with retry, anti-blocking headers, and SPA detection |
 | `extract` | Extract clean text using 2-pass consensus with CSS/JS sanitization |
 | `follow_links` | Follow links from a page, optionally filtered by URL pattern or anchor text |
-| `paginate` | Auto-detect and follow pagination (5 patterns: query param, offset, cursor, path segment, rel=next) |
-| `search_index` | Query the persistent local full-text index from previously crawled content. Reports document age and warns on stale results (>24h) |
+| `paginate` | Auto-detect and follow pagination (5 patterns) |
+| `search_index` | Query the persistent local full-text index. Reports document age and warns on stale results (>24h) |
 | `find_similar` | Find semantically similar content using neural vector embeddings (MiniLM-L6) |
-| `get_entities` | Extract named entities using regex patterns (emails, URLs, dates, money, percentages, phone numbers) and capitalized phrase detection (persons, organizations, locations) |
+| `get_entities` | Extract named entities using regex patterns and capitalized phrase detection |
 | `get_link_graph` | Map outgoing links from a URL with anchor text and external/internal classification |
 
 ## Anti-Hallucination Pipeline
 
-All 5 stages now fully operational with ML models:
-
 ```
-Stage 1: Dual Retrieval + RRF Fusion                      ~5ms
-         BM25 (tantivy) + Vector (HNSW/MiniLM-L6)
-         Reciprocal Rank Fusion: score = Σ 1/(60 + rank_i)
-         Top-50 candidates (was 300)
-         
-Stage 2: Cross-Encoder Rerank                             ~50ms
-         ms-marco-MiniLM-L-6-v2 with classification head
-         ONNX Runtime (INT8 quantized, optional) or Candle
-         Score cache: DashMap skips repeated (query, doc) pairs
-         Top-15 scored (was all candidates)
-         
-Stage 3: Authority + Freshness                            ~1ms
-         TrustRank via domain tier classification
-         Adaptive freshness decay per query type
-         News: λ=0.1 (7-day half-life)
-         Research: λ=0.005 (139-day half-life)
-         
-Stage 4: Anti-Hallucination Layer                         ~15ms
+Stage 0: Query-Term Relevance Gate                       ~0ms
+         Rejects candidates with <30% distinctive query terms
+         Stop-word filtering (60+ common words excluded)
+         Prevents irrelevant pages from reaching ML stages
+
+Stage 1: Dual Retrieval + RRF Fusion                     ~5ms
+         BM25 (tantivy + SPLADE body) + Vector (HNSW/MiniLM-L6)
+         Reciprocal Rank Fusion: score = Sigma 1/(60 + rank_i)
+         Top-50 candidates
+
+Stage 2: ColBERT / Cross-Encoder Rerank                  ~5-50ms
+         ColBERT (primary): mxbai-edge-colbert-17m INT8 ONNX
+           MaxSim scoring, 48-dim token embeddings, ~5-10ms
+         Cross-encoder (fallback): ms-marco-MiniLM-L-6-v2
+           With BERT pooler + classification head, ~50ms
+         Score cache: DashMap + redb persistent disk cache
+         Top-15 scored
+
+Stage 3: Authority + Freshness + Primary Source          ~1ms
+         3a. TrustRank via domain tier (120+ domains)
+         3b. Primary source boost (200+ entity-domain mappings)
+             Up to 4.5x boost for official/canonical domains
+         3c. Adaptive freshness decay per query type
+         3d. Query anchor penalty (0.5x for missing all query terms)
+
+Stage 4: Anti-Hallucination Layer                        ~15ms
          A. Cross-reference validation (3+ sources = Verified)
-         B. NLI contradiction detection (nli-deberta-v3-small, ~140MB)
-            Pairwise entailment/contradiction/neutral classification
-            Confidence threshold: 0.7 for flagging
+         B. NLI contradiction detection (MLP classification head)
+            Pairwise entailment/contradiction/neutral
          C. Echo chamber detection (unique source organizations)
          D. Numeric contradiction heuristic (20% threshold)
          E. Claim-source attribution mapping
-         
-Stage 5: Diversity Filter                                 ~3ms
+
+Stage 5: Diversity Filter                                ~3ms
          Query-relevant snippet extraction
-         SimHash near-duplicate removal (hamming ≤ 3)
-         MMR reranking (λ=0.7 relevance vs diversity)
-         Max 2 results per domain
-         Min 3 unique source organizations
+         SimHash near-duplicate removal (hamming <= 3)
+         MMR reranking (lambda=0.7 relevance vs diversity)
+         Max 2 results per domain, min 3 unique orgs
 ```
 
 ### ML Models (auto-downloaded on first run)
@@ -142,12 +142,12 @@ Stage 5: Diversity Filter                                 ~3ms
 | Model | HuggingFace ID | Size | Purpose |
 |-------|---------------|------|---------|
 | MiniLM-L6-v2 | `sentence-transformers/all-MiniLM-L6-v2` | ~22MB | Bi-encoder embeddings for semantic search |
-| MS MARCO MiniLM | `cross-encoder/ms-marco-MiniLM-L-6-v2` | ~80MB (FP32) / ~23MB (INT8) | Stage 2 cross-encoder reranking |
-| NLI MiniLM2 | `cross-encoder/nli-MiniLM2-L6-H768` | ~80MB | Stage 4 contradiction detection |
+| MS MARCO MiniLM | `cross-encoder/ms-marco-MiniLM-L-6-v2` | ~80MB (FP32) / ~23MB (INT8) | Stage 2 cross-encoder reranking (with pooler) |
+| NLI MiniLM2 | `cross-encoder/nli-MiniLM2-L6-H768` | ~80MB | Stage 4 contradiction detection (MLP head) |
+| ColBERT | `ryandono/mxbai-edge-colbert-v0-17m-onnx-int8` | ~68MB | Stage 2 ColBERT MaxSim (ONNX, optional) |
+| SPLADE | `prithivida/Splade_PP_en_v1` | ~532MB | Sparse term expansion (ONNX, optional) |
 
-Total first-run download: ~182MB. Cached at `~/.cache/huggingface/` — subsequent runs are instant.
-
-Default: Candle (pure Rust, CPU). Optional: ONNX Runtime with INT8 quantization (`--features onnx`, 5-10x faster, requires MSVC on Windows).
+Default: Candle (pure Rust, CPU). Optional: ONNX Runtime with INT8 quantization (`--features onnx`, includes ColBERT + SPLADE).
 
 ### Source Tiers
 
@@ -163,7 +163,8 @@ Default: Candle (pure Rust, CPU). Optional: ONNX Runtime with INT8 quantization 
 - **Rust 1.85+** (edition 2024)
 - **No API keys** — the server crawls the web directly
 - **No GPU required** — all ML models run on CPU via Candle
-- **Internet** — required for first-run model download (~242MB) and web crawling
+- **Docker** (recommended) — for self-hosted SearXNG metasearch
+- **Internet** — required for first-run model download and web crawling
 - **~500MB disk** — for model cache + persistent search index
 
 ## Installation
@@ -178,21 +179,53 @@ cargo build --release
 
 The binary will be at `target/release/web-search-mcp` (or `web-search-mcp.exe` on Windows).
 
-First run downloads ML models automatically from HuggingFace (~242MB).
+First run downloads ML models automatically from HuggingFace (~182MB for base, ~600MB with ONNX features).
+
+### Set up SearXNG (recommended)
+
+SearXNG aggregates Google/Bing/DDG results without CAPTCHA or bot detection:
+
+```bash
+# Start SearXNG
+docker run -d -p 8080:8080 --name searxng searxng/searxng
+
+# Enable JSON API
+docker exec searxng sed -i 's/^  formats:/  formats:\n    - json/' /etc/searxng/settings.yml
+docker restart searxng
+
+# Verify
+curl "http://localhost:8080/search?q=test&format=json" | head -c 100
+```
+
+Then set in `config/default.toml`:
+```toml
+[crawler]
+searxng_url = "http://localhost:8080"
+```
+
+Without SearXNG, the server falls back to direct scraping of search engines (less reliable due to CAPTCHA/JS rendering).
+
+### Build with ONNX features (ColBERT + SPLADE)
+
+```bash
+cargo build --release --features onnx
+```
+
+Enables:
+- **ColBERT reranking** — 160-400x faster than cross-encoder for Stage 2
+- **SPLADE sparse retrieval** — semantic term expansion for Stage 1
+
+Requires ONNX Runtime (auto-downloaded via `ort` crate). MSVC target on Windows.
 
 ### Build with headless browser support
 
-For JS-rendered pages (Google, Bing, SPAs), enable the `browser` feature (requires Chrome/Chromium installed):
+For JS-rendered pages (Google, Bing, SPAs):
 
 ```bash
 cargo build --release --features browser
 ```
 
-The browser is lazy-initialized — only launches when a page is detected as SPA or a search engine returns 0 results.
-
 ### Minimal build (no ML models)
-
-For a lightweight build without neural models (uses hash-based embeddings, no reranking or NLI):
 
 ```bash
 cargo build --release --no-default-features -p web-search-embedder
@@ -233,23 +266,15 @@ Then in Claude Code, the tools are available automatically:
 Use quick_search to find information about quantum computing
 Use deep_research to investigate the impact of microplastics on marine life
 Use verify_claim to check if "The Great Wall of China is visible from space"
-Use extract to get clean content from https://en.wikipedia.org/wiki/Rust_(programming_language)
-Use compare_sources to compare Rust and Go getting started guides
+Use streaming_search for fast progressive results about Rust vs Go
 ```
 
 ### With Any MCP Client
 
-The server communicates over **stdio** using JSON-RPC 2.0 (MCP protocol). Any MCP-compatible client works:
+The server communicates over **stdio** using JSON-RPC 2.0 (MCP protocol):
 
 ```bash
-# Start the server (logs to stderr, MCP on stdout)
 ./target/release/web-search-mcp
-```
-
-Example initialization:
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"my-app","version":"1.0"}}}
 ```
 
 Example tool calls:
@@ -257,17 +282,9 @@ Example tool calls:
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"quick_search","arguments":{"query":"Rust vs Go performance","max_results":5}}}
 
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"verify_claim","arguments":{"claim":"Python is faster than C++","min_sources":5}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"streaming_search","arguments":{"query":"NVIDIA H200 vs B200 GPU comparison","max_results":8}}}
 
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"extract","arguments":{"url":"https://en.wikipedia.org/wiki/Quantum_computing"}}}
-```
-
-### Standalone Testing
-
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"extract","arguments":{"url":"https://en.wikipedia.org/wiki/Rust_(programming_language)"}}}' | timeout 20 ./target/release/web-search-mcp
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"verify_claim","arguments":{"claim":"Python is faster than C++","min_sources":5}}}
 ```
 
 ## Configuration
@@ -280,30 +297,30 @@ num_workers = 8                          # concurrent fetch tasks
 requests_per_second_per_domain = 2.0     # politeness rate limit
 request_timeout_secs = 30
 respect_robots_txt = true
+# SearXNG instance URL (recommended — aggregates search engines via JSON API)
+# Setup: docker run -d -p 8080:8080 searxng/searxng
+searxng_url = "http://localhost:8080"
 
 [indexer]
-index_path = "data/index"               # persistent tantivy index
+index_path = "data/index"               # persistent tantivy index (incl. splade_body field)
 vector_index_path = "data/vectors"       # persistent HNSW vectors
 simhash_threshold = 3                    # near-duplicate hamming distance
 
 [ranker]
 bm25_top_k = 200           # Stage 1 BM25 candidates
 hnsw_top_k = 200           # Stage 1 vector candidates
-rerank_top_k = 50          # Stage 2 cross-encoder output
-mmr_lambda = 0.7           # diversity vs relevance (0=diverse, 1=relevant)
+rerank_top_k = 50          # Stage 2 output
+mmr_lambda = 0.7           # diversity vs relevance
 max_results_per_domain = 2 # prevent single-source dominance
-min_unique_orgs = 3        # echo chamber detection threshold
+min_relevance_score = 0.05 # minimum score floor (safety: always returns top_k)
 
 [embedder]
 embedding_dim = 384        # MiniLM-L6 dimensions
 batch_size = 32
-force_cpu = false          # set true to skip neural embedder
 
 [server]
 data_dir = "data"          # persistent storage directory
 ```
-
-Source credibility tiers at `config/source_tiers.toml`.
 
 ## Response Format
 
@@ -318,23 +335,8 @@ All search tools return structured JSON with verification metadata:
       "title": "Article Title",
       "confidence": 0.95,
       "verification": "Verified",
-      "claims": [
-        {
-          "text": "specific claim extracted from the article",
-          "source_url": "https://source.com/article",
-          "confidence": 0.95,
-          "verification": "Verified"
-        }
-      ],
-      "contradictions": [
-        {
-          "claim_a": "Source A says X",
-          "source_a": "https://a.com/article",
-          "claim_b": "Source B says Y",
-          "source_b": "https://b.com/article",
-          "severity": "Hard"
-        }
-      ],
+      "claims": [...],
+      "contradictions": [...],
       "source_tier": "Tier1",
       "freshness": "2026-05-10T00:00:00Z",
       "relevance_score": 1.25
@@ -342,94 +344,52 @@ All search tools return structured JSON with verification metadata:
   ],
   "synthesis": [
     {
-      "text": "Key finding extracted via TextRank graph-based summarization...",
-      "score": 0.1607,
+      "text": "Key finding extracted via TextRank...",
+      "score": 0.89,
       "source_url": "https://source.com/article",
       "source_title": "Article Title"
     }
   ],
-  "warnings": [
-    "NLI model detected semantic contradictions across sources",
-    "Limited source diversity: only 2 unique organizations"
-  ],
-  "coverage_score": 0.85,
-  "total_pages_crawled": 50,
-  "total_time_ms": 77,
+  "warnings": [],
+  "coverage_score": 3.3,
+  "total_pages_crawled": 14,
+  "total_time_ms": 5795,
   "query": "original search query"
 }
 ```
 
-### Verification Levels
-
-| Status | Meaning | Confidence |
-|--------|---------|------------|
-| `Verified` | 3+ independent source organizations confirm | 0.95 |
-| `Partial` | 2 sources confirm | 0.75 |
-| `Unverified` | Single source only | 0.50 |
-| `Contested` | NLI model detected contradictions | 0.30 |
-
-### Contradiction Severity
-
-| Severity | Meaning |
-|----------|---------|
-| `Hard` | Direct factual contradiction (NLI confidence > 0.9 or numeric disagreement > 100%) |
-| `Soft` | Nuanced disagreement (NLI confidence 0.7-0.9 or numeric disagreement 20-100%) |
-| `Temporal` | Information changed over time |
-
 ## Persistent Storage
-
-The server maintains persistent state across sessions:
 
 ```
 data/
-├── index/          # Tantivy full-text search index (mmap-backed, with indexed_at timestamps)
+├── index/          # Tantivy full-text index (incl. splade_body field)
 ├── vectors/
-│   └── hnsw.json   # HNSW vector embeddings (384-dim, bincode binary format — auto-migrates from JSON)
-└── dedup.json      # URL seen set (with TTL timestamps) + SimHash fingerprints + content hashes
+│   └── hnsw.json   # HNSW vector embeddings (384-dim, bincode)
+├── cache.redb      # Persistent KV cache (embeddings + CE scores, redb)
+└── dedup.json      # URL seen set + SimHash fingerprints
 ```
 
-- First search builds the index from scratch
-- Subsequent searches query existing index AND crawl new content
-- Index grows over time as more content is crawled
-- Each document tracks `indexed_at` timestamp — search results report age and warn on stale content (>24h)
-- Vector index uses bincode binary serialization (~5x smaller, faster load/save than JSON)
-- HTTP responses cached in-memory (LRU, 2000 entries, 10-minute TTL) to avoid re-fetching during a session
-- URL dedup entries expire after 1 hour — enables re-crawling updated content on repeat queries
-- Content hash dedup is permanent — identical content is always detected regardless of URL
+- **redb cache** — embeddings and cross-encoder scores loaded on startup, flushed every 30s and on shutdown (Drop impl). Survives restarts.
+- **Background daemon** — pre-fetches discovered links, populates URL cache for faster subsequent queries
 - Delete `data/` directory to reset
 
-## Search Engine Coverage
+## Benchmark Results
 
-The crawler parses search result pages from 13 engines and follows actual result links:
+![Benchmark Comparison](images/Gemini_Generated_Image_fm7pukfm7pukfm7p.png)
 
-| Engine | What's Extracted |
-|--------|-----------------|
-| Google | Result links (handles `/url?q=` redirects, multi-selector fallback) |
-| Bing | Result links (`li.b_algo` containers, `h2 a` selectors) |
-| Brave Search | Result links (class `l1`) |
-| Mojeek | Result links (class `title`) |
-| DuckDuckGo | Result links (decoded redirect URLs, 2026 `#links .result` selectors) |
-| Wikipedia | Article links from search results |
-| ArXiv | Paper abstract links (`/abs/`) |
-| Reddit (old) | Comment thread links (`/comments/`) |
-| Hacker News | External links from stories (Algolia JSON API) |
-| Google Scholar | Paper links |
-| PubMed | Article links (numeric IDs, `docsum-title` class) |
-| SearXNG (x2) | **Metasearch JSON API** — aggregates Google/Bing/DDG results without CAPTCHA |
+Tested against Claude WebSearch on complex query: "NVIDIA H200 vs B200 GPU pricing and performance for LLM inference 2025-2026"
 
-**SearXNG metasearch** is the key innovation for bypassing CAPTCHA/JS-rendering limitations. SearXNG instances aggregate results from major search engines server-side and return clean JSON, giving access to Google/Bing results that would otherwise be blocked by CAPTCHA when crawling directly.
+| Metric | MCP Server (SearXNG) | Claude WebSearch |
+|--------|---------------------|-----------------|
+| Results | 6 relevant | 10 relevant |
+| Wall clock | 19.3s | ~1-2s |
+| Pipeline time | 5.8s | N/A |
+| Source overlap | 3/6 match Claude | baseline |
+| Content depth | Full paragraph extracts | Summary |
+| Repeat query | <1s (index-first) | ~1-2s |
+| API keys needed | 0 | Anthropic API |
 
-**Parser health monitoring**: If any parser returns 0 results from a content-rich page (>2KB HTML, >10 links), a warning is logged identifying the potentially outdated parser. When a search engine returns 0 results, the crawler automatically retries via headless browser if the `browser` feature is enabled.
-
-### Query Reformulation
-
-Query expansion generates multiple search variants per query:
-
-- **40+ synonym pairs** — "impact" -> "effect"/"influence", "machine learning" -> "AI"/"ML", "fast" -> "quick"/"rapid"/"high-performance", etc.
-- **Domain-specific expansion** — medical queries add "clinical study", scientific add "research paper", news add current year
-- **Question variants** — short queries get "what is X" variant, question queries get declarative variant
-- **Technical expansion** — tech queries add "documentation" and "tutorial" variants
-- **Up to 6 variants** searched across all 13 engines per variant
+All MCP results relevant (6/6). Sources include gpu.fm, vast.ai, spheron.network, gmicloud.ai, deploybase.ai, intuitionlabs.ai.
 
 ## Tests
 
@@ -437,137 +397,23 @@ Query expansion generates multiple search variants per query:
 cargo test
 ```
 
-187 tests across all crates:
-
-- Search result parsers (Google, Bing, Brave, Mojeek, Wikipedia, ArXiv, SearXNG — 13 tests)
-- Parser health detection + dedup (3 tests)
-- Content extraction accuracy + CSS sanitization (10 tests)
-- Snippet extraction relevance (4 tests)
-- Language detection (English, Chinese, Spanish, HTML lang attr — 4 tests)
-- SimHash near-duplicate detection (3 tests)
-- HNSW vector search (5 tests)
-- Tantivy full-text index with indexed_at timestamps (3 tests)
-- Dedup store with TTL (exact + near + URL + expiry — 5 tests)
-- ISR fusion + MMR diversity (4 tests)
-- Query type detection (5 tests)
-- Authority classification + domain-to-org mapping (11 tests)
-- Freshness decay curves per query type (8 tests)
-- Anti-hallucination checks (cross-reference, contradiction, echo chamber — 7 tests)
-- URL frontier dedup, priority, domain limits (7 tests)
-- Pagination pattern detection + URL generation (7 tests)
-- Robots.txt parsing + cache (7 tests)
-- Link extraction and resolution (7 tests)
-- Query reformulation with synonyms + domain expansion (8 tests)
-- Sitemap XML parsing (3 tests)
-- Cosine similarity + embeddings (10 tests)
-- NER regex extraction (emails, money, dates, percentages — 7 tests)
-- TextRank synthesis (graph scoring, dedup, tokenization, Jaccard — 7 tests)
-- Browser pool initialization (1 test)
+205 tests across all crates covering search parsers, extraction, indexing, ranking pipeline, caching, entity-domain mappings, streaming events, daemon priority queue, and more.
 
 ## Project Stats
 
 | Metric | Value |
 |--------|-------|
 | Language | Rust (edition 2024) |
-| Total lines of code | ~21,000 |
 | Crates | 8 |
-| MCP tools | 14 (6 smart + 8 atomic) |
-| Search engines | 13 (Google, Bing, Brave, Mojeek, DDG, Wikipedia, ArXiv, Reddit, HN, Scholar, PubMed, SearXNG x2) |
-| Tests | 187 passing |
-| ML models | 3 (auto-downloaded, ONNX optional) |
+| MCP tools | 15 (7 smart + 8 atomic) |
+| Search engines | 13 + SearXNG (configurable) |
+| Tests | 205 passing |
+| ML models | 3 base + 2 optional (ColBERT, SPLADE) |
 | Source tiers | 120+ classified domains |
-| Crawler concurrency | 8-16 workers (FuturesUnordered) |
-| Retrieval fusion | Reciprocal Rank Fusion (RRF, k=60) |
-| Synthesis algorithm | Query-focused MMR + TextRank hybrid |
-| Semantic query cache | <1s on similar queries (cosine > 0.92, 4h TTL) |
-| Cross-encoder funnel | RRF top-50 → CE top-15 → final top-k |
-| Result diversification | xQuAD subtopic coverage + query anchor penalty |
-| Caching layers | 4 (semantic query, URL content, embedding content-hash, CE score) |
-| Language filter | HTML lang + stop-word heuristic (skips non-English) |
-| Synonym pairs | 40+ |
-| Dedup TTL | 1-hour URL expiry, permanent content hashes |
-| Binary size | ~27MB (release) |
-| Instant search | ~1-2s (cache + SearXNG, no cross-encoder) |
-| Index-first hit | <100ms (pre-indexed results, no crawl) |
-| Cold query time | ~15-20s (halved crawl budgets) |
-| Cached query time | <1s |
+| Entity-domain mappings | 200+ (AI, GPU, cloud, languages, frameworks) |
+| Caching layers | 5 (semantic query, URL content, embedding hash, CE score, redb disk) |
+| Ranking stages | 6 (gate, RRF, ColBERT/CE, authority+primary, NLI, diversity) |
 | External API dependencies | 0 |
-
-## Recent Changes
-
-### v0.5.0 — Google-Inspired Architecture: Index-First, RRF, ONNX
-
-Research-driven overhaul based on gap analysis vs Claude WebSearch (was 30x slower). Applied Google search architecture patterns: index-first retrieval, two-phase funnel, RRF fusion, and aggressive caching.
-
-**Latency:**
-- **Index-first retrieval** — searches persistent Tantivy + HNSW before crawling. Fresh results (<24h) returned instantly without any crawl. Eliminates 44% of query latency on repeat/similar queries
-- **ONNX Runtime cross-encoder** — optional backend with INT8 quantized model (23MB, 5-10x faster). `Reranker` enum: ONNX first → Candle fallback. Feature-gated (`--features onnx`)
-- **Classification head fix** — cross-encoder was outputting mean of 768-dim hidden state (garbage). Now loads `classifier.weight/bias` and applies proper linear projection
-- **Score cache** — DashMap `(query_hash, doc_hash) → f32` memoizes cross-encoder inference. Repeated query+doc pairs skip scoring
-- **Tighter retrieval funnel** — RRF top-50 → cross-encoder top-15 → final top-k (was 300 → all → top-k)
-- **Halved crawl budgets** — factual: 10 pages/5s, general: 25 pages/10s (was 50 pages/15s for everything)
-- **Embedding content-hash cache** — DashMap avoids re-embedding identical text across queries
-- **URL result cache** — 4-hour TTL, 500 URL cap. Skips re-crawling + re-extracting same URLs
-- **ML warmup on startup** — `engine.warmup()` pre-loads models before accepting requests
-- **Graceful degradation** — returns partial results when time budget exceeded instead of hanging
-
-**Quality:**
-- **Reciprocal Rank Fusion** — `score = Σ 1/(60 + rank_i)`, standard formula, 15-30% better than ISR (1/rank²)
-- **Query anchor penalty** — 0.5x score for results missing all original query words. Fixes query drift (H200 → B200)
-- **120+ source tiers** — TechCrunch, Bloomberg, Fortune, NVIDIA, OpenAI etc properly classified (was ~30 domains)
-- **Language filter** — skips non-English pages using HTML lang attribute + stop-word heuristic
-- **Citation stripping** — removes Wikipedia footnotes (`^ a b c`), reference brackets (`[1][2]`), "Retrieved/Archived" patterns
-- **SERP filter** — `is_serp_page()` now called during extraction — search result pages no longer indexed as content
-- **Verification fix** — fuzzy claim matching 60% → 40% (more claims reach Verified), contradiction context widened 3 → 5 words
-- **Echo chamber warnings** — include domain list for transparency
-- **Adaptive crawl depth** — factual queries get minimal crawl, research queries get deeper crawl
-
-**New tools:**
-- **`instant_search`** — ultra-fast ~1-2s path: semantic cache → 3s crawl timeout → extract-only (skips cross-encoder + embedding entirely)
-
-**Infrastructure:**
-- **O(n²) → O(n) hybrid rank lookup** — HashMap URL index replaces linear `.find()` scan in apply_hybrid_ranks
-- Removed dead code (`softmax_3`), 6 unused imports cleaned across 5 files
-- `onnx` feature propagation through ranker crate
-
-### v0.4.0 — Academic Algorithm Implementations
-
-Six research-backed algorithms to close the speed and relevance gap with commercial search APIs:
-
-- **Semantic query cache** ([GoVector 2026](https://arxiv.org/html/2508.15694v1), [Semantic Caching](https://redis.io/blog/how-to-cache-semantic-search/)) — caches `SearchResponse` by query embedding. New queries compared via cosine similarity; >0.85 = instant cache hit (<1s). "Advantages of Rust language" hits cache for "Rust programming language benefits". 30-minute TTL, 100 entries. **Eliminates re-crawl for conversational refinement**
-- **Early termination in cross-encoder** ([Efficient Neural Ranking 2023](https://arxiv.org/pdf/2311.01263)) — scores candidates in batches of 8, sorted by ISR score. Stops when batch max drops below 50% of running max. **46% faster ranking** (27.9s → 15.1s) with no quality loss
-- **Query-focused MMR synthesis** ([MMR-guided RL Summarization](https://arxiv.org/abs/2010.00117)) — hybrid TextRank + MMR: `score = λ * query_relevance + (1-λ) * textrank_importance - penalty * redundancy`. λ=0.6 biases toward query-relevant sentences. Greedy selection with diversity penalty. **Better synthesis than pure TextRank**
-- **URL relevance prediction** ([Fast Webpage Classification](https://www.comp.nus.edu.sg/~kanmy/papers/nustrc8_05.pdf)) — scores URLs before fetching: anchor text overlap + URL path token matching with query. `push_with_context(url, depth, anchor, query)` in frontier. Higher-relevance URLs crawled first. **No wasted fetches**
-- **xQuAD result diversification** ([Santos et al.](https://link.springer.com/chapter/10.1007/978-3-642-12275-0_11)) — post-ranking reorder to maximize subtopic coverage. Extracts bigrams per result, greedily picks results covering uncovered subtopics. **Ensures breadth across query aspects**
-- **Pipelined cache-first architecture** — semantic cache checked before any crawl. Cold queries flow through crawl→extract→embed→rank→cache pipeline. Warm queries skip everything
-
-### v0.3.0 — Deep Performance & Algorithm Fixes
-
-Focused on closing the gap with commercial search APIs (speed, relevance, synthesis quality):
-
-- **FuturesUnordered streaming crawler** — replaced batch+semaphore loop with `FuturesUnordered` stream. Pages processed as they arrive, no head-of-line blocking. Concurrency increased from 4 to 8-16 workers. Idle tolerance raised from 0.6s to 5s
-- **Batch embeddings** — two-phase page processing: Phase 1 extracts + indexes all pages (no ML), Phase 2 runs single batched `embed()` call for all texts. Eliminates N sequential `embed_one()` calls
-- **Parallel extraction (rayon)** — Readability + Trafilatura passes now run in parallel via `rayon::join`. Extraction of 50 pages: 3-6s → **740ms** (8x faster)
-- **TextRank graph synthesis** — replaced TF-IDF with TextRank algorithm: builds cosine similarity graph between sentence TF-IDF vectors, runs 30 iterations of PageRank with 0.85 damping, extracts structurally important sentences across all results. Jaccard dedup at 0.5 threshold
-- **SearXNG metasearch** — added 2 SearXNG public instances as search sources. SearXNG aggregates Google/Bing/DDG server-side and returns JSON, bypassing CAPTCHA/JS-rendering limitations. New JSON parser for SearXNG response format
-- **Headless browser module** — new `browser.rs` with chromiumoxide `BrowserPool`. Feature-gated (`--features browser`), lazy-init on first SPA detection. Fetcher auto-retries via browser when SPA detected. Crawler retries search engines via browser when parser returns 0
-- **Smart frontier priority** — composite scoring: depth + domain authority bonus (0.3 for .gov/.edu, 0.2 for Wikipedia/GitHub, 0.1 for Reddit/Medium) + domain diversity factor. Higher-quality pages crawled first
-- **Dedup TTL** — URL entries now expire after 1 hour (configurable). Content hash dedup permanent. v2 JSON format with timestamps, auto-migrates v1. Repeat queries get fresh results
-- **Relaxed content filter** — word threshold 30→15, CAPTCHA detection requires 2+ block phrases or <100 words (was: 1 phrase + <200 words). Body minimum 50→30 chars. Fewer false rejections
-- **DuckDuckGo parser update** — added 2026 CSS selectors (`#links .result`, `.result__body`, `.result__snippet`)
-- **SearchResponse synthesis field** — new `SynthesizedSentence` type with text, score, source_url, source_title. Populated by TextRank after ranking
-
-### v0.2.0 — Gap Fixes
-
-- **Google + Bing search parsers** — added parsers for the two largest search engines with multi-selector fallbacks and redirect URL decoding
-- **HTTP response cache** — moka LRU cache (2000 entries, 10min TTL) avoids re-fetching same URLs within a session, captures ETag/Last-Modified headers
-- **Parser health monitoring** — warns when a search engine parser returns 0 results from a content-rich page, helping detect when parsers become outdated
-- **Index staleness tracking** — all indexed documents stamped with `indexed_at` timestamp, `search_index` tool reports document age and warns on >24h stale content
-- **Bincode vector serialization** — switched HNSW vectors from JSON to bincode binary format (~5x smaller files, faster load/save), auto-migrates legacy JSON on first load
-- **Enhanced NER** — regex-based extraction of emails, URLs, dates (4 formats), money ($, EUR, GBP, JPY), percentages, phone numbers, plus improved capitalized phrase detection with product/org heuristics
-- **Progress notifications** — broadcast channel reports 5-stage progress during `deep_research` (seed generation, wave 1, wave 2, indexing, ranking), logged as structured tracing events for MCP-aware clients
-- **Language detection** — text-based language detection using Unicode block analysis + stopword frequency covering 11 languages (en, zh, ja, ko, ar, ru, hi, es, fr, de, pt), falls back when HTML `lang` attribute is missing
-- **Expanded query reformulation** — 40+ synonym pairs (up from 16), domain-specific expansion (medical -> "clinical study", scientific -> "research paper", news -> current year), question variant generation, increased variant limit from 4 to 6
 
 ## License
 

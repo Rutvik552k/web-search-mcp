@@ -9,6 +9,7 @@ use web_search_indexer::simhash;
 
 use crate::authority;
 use crate::diversity::{self, DiversityCandidate};
+use crate::entity_domain;
 use crate::freshness;
 use crate::hallucination::{self, DocClaims};
 use crate::query_type;
@@ -56,11 +57,15 @@ impl Reranker {
 /// Stage 5: Diversity filter (MMR + domain cap + dedup) → final top K
 pub struct RankingPipeline {
     config: RankerConfig,
-    /// Cross-encoder for Stage 2 reranking (ONNX or Candle backend)
+    /// Cross-encoder for Stage 2 reranking (ONNX or Candle backend).
+    /// Falls back to this when ColBERT is unavailable. Also used for Stage 4 NLI.
     reranker: Option<Arc<Reranker>>,
+    /// ColBERT late-interaction reranker for Stage 2 (160-400x faster than CE).
+    #[cfg(feature = "onnx")]
+    colbert: Option<Arc<web_search_embedder::colbert::ColBertReranker>>,
     /// NLI model for Stage 4 contradiction detection
     nli_model: Option<Arc<Reranker>>,
-    /// Cache: (query_hash, doc_content_hash) -> cross-encoder score.
+    /// Cache: (query_hash, doc_content_hash) -> reranker score.
     score_cache: dashmap::DashMap<(u64, u64), f32>,
 }
 
@@ -82,13 +87,40 @@ pub struct RankCandidate {
 
 impl RankingPipeline {
     pub fn new(config: RankerConfig) -> Self {
-        // Load reranker: try ONNX first (5-10x faster), fall back to Candle
+        // Load ColBERT for Stage 2 (160-400x faster than cross-encoder)
+        #[cfg(feature = "onnx")]
+        let colbert = {
+            match web_search_embedder::colbert::ColBertReranker::new() {
+                Ok(c) => {
+                    tracing::info!("ColBERT reranker loaded — Stage 2 will use MaxSim");
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    tracing::info!("ColBERT unavailable, falling back to cross-encoder: {e}");
+                    None
+                }
+            }
+        };
+
+        // Load cross-encoder: fallback for Stage 2 + used for Stage 4 NLI
         let reranker = Self::load_reranker("cross-encoder/ms-marco-MiniLM-L-6-v2");
 
         // Load NLI model: same priority — ONNX > Candle > None
         let nli_model = Self::load_reranker("cross-encoder/nli-MiniLM2-L6-H768");
 
-        Self { config, reranker, nli_model, score_cache: dashmap::DashMap::new() }
+        Self {
+            config,
+            reranker,
+            #[cfg(feature = "onnx")]
+            colbert,
+            nli_model,
+            score_cache: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Access the cross-encoder score cache for persistence (load/flush to disk).
+    pub fn score_cache(&self) -> &dashmap::DashMap<(u64, u64), f32> {
+        &self.score_cache
     }
 
     /// Try loading a cross-encoder model. ONNX first (fast), Candle fallback.
@@ -120,6 +152,172 @@ impl RankingPipeline {
         }
     }
 
+    /// Stage 2 via ColBERT MaxSim. Returns true if ColBERT was used.
+    #[allow(unused_variables)]
+    fn stage2_colbert(
+        &self,
+        candidates: &[RankCandidate],
+        query: &str,
+        scored: &mut Vec<(usize, f32)>,
+    ) -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            if let Some(ref colbert) = self.colbert {
+                let start = std::time::Instant::now();
+                let query_hash = hash_str(query);
+                let mut cache_hits = 0_usize;
+
+                // Check cache first, collect uncached
+                let mut cached_results: Vec<(usize, f32)> = Vec::new();
+                let mut need_score: Vec<(usize, usize, String)> = Vec::new(); // (pos_in_scored, candidate_idx, truncated)
+
+                for (pos, &(idx, rrf_score)) in scored.iter().enumerate() {
+                    let body = &candidates[idx].body_text;
+                    let truncated: String = body.chars().take(512).collect();
+                    let doc_hash = hash_str(&truncated);
+                    let cache_key = (query_hash, doc_hash);
+
+                    if let Some(cached) = self.score_cache.get(&cache_key) {
+                        let blended = 0.3 * rrf_score + 0.7 * *cached;
+                        cached_results.push((idx, blended));
+                        cache_hits += 1;
+                    } else {
+                        need_score.push((pos, idx, truncated));
+                    }
+                }
+
+                // Score uncached docs with ColBERT
+                if !need_score.is_empty() {
+                    let docs: Vec<&str> = need_score.iter().map(|(_, _, t)| t.as_str()).collect();
+                    match colbert.score_documents(query, &docs) {
+                        Ok(scores) => {
+                            for (i, score) in scores.iter().enumerate() {
+                                if i >= need_score.len() { break; }
+                                let (pos, idx, ref truncated) = need_score[i];
+                                let doc_hash = hash_str(truncated);
+                                self.score_cache.insert((query_hash, doc_hash), *score);
+                                let rrf_score = scored[pos].1;
+                                let blended = 0.3 * rrf_score + 0.7 * score;
+                                cached_results.push((idx, blended));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("ColBERT scoring failed, falling back: {e}");
+                            return false;
+                        }
+                    }
+                }
+
+                cached_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                tracing::debug!(
+                    scored = cached_results.len(),
+                    cache_hits,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Stage 2 complete (ColBERT MaxSim)"
+                );
+
+                *scored = cached_results;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Stage 2 via cross-encoder (fallback when ColBERT unavailable).
+    fn stage2_cross_encoder(
+        &self,
+        candidates: &[RankCandidate],
+        query: &str,
+        scored: &mut Vec<(usize, f32)>,
+    ) {
+        if let Some(reranker) = &self.reranker {
+            let query_hash = hash_str(query);
+            let early_term_min = 15.min(scored.len());
+            let batch_size = 8;
+            let mut ce_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
+            let mut max_ce_score = 0.0_f32;
+            let mut terminated_early = false;
+            let mut cache_hits = 0_usize;
+
+            for chunk_start in (0..scored.len()).step_by(batch_size) {
+                let chunk_end = (chunk_start + batch_size).min(scored.len());
+                let chunk = &scored[chunk_start..chunk_end];
+
+                let mut need_inference: Vec<(usize, usize, String)> = Vec::new();
+                for (ci, &(idx, rrf_score)) in chunk.iter().enumerate() {
+                    let body = &candidates[idx].body_text;
+                    let truncated: String = body.chars().take(256).collect();
+                    let doc_hash = hash_str(&truncated);
+                    let cache_key = (query_hash, doc_hash);
+
+                    if let Some(cached) = self.score_cache.get(&cache_key) {
+                        let blended = 0.3 * rrf_score + 0.7 * *cached;
+                        ce_scores.push((idx, blended));
+                        max_ce_score = max_ce_score.max(*cached);
+                        cache_hits += 1;
+                    } else {
+                        need_inference.push((ci, idx, truncated));
+                    }
+                }
+
+                if !need_inference.is_empty() {
+                    let pairs: Vec<(&str, &str)> = need_inference.iter()
+                        .map(|(_, _, doc)| (query, doc.as_str()))
+                        .collect();
+
+                    match reranker.score_pairs(&pairs) {
+                        Ok(scores) => {
+                            let mut batch_max = 0.0_f32;
+                            for (i, ce_score) in scores.iter().enumerate() {
+                                if i >= need_inference.len() { break; }
+                                let (ci, idx, ref truncated) = need_inference[i];
+                                let global_i = chunk_start + ci;
+                                if global_i < scored.len() {
+                                    let doc_hash = hash_str(truncated);
+                                    self.score_cache.insert((query_hash, doc_hash), ce_score.score);
+                                    let blended = 0.3 * scored[global_i].1 + 0.7 * ce_score.score;
+                                    ce_scores.push((idx, blended));
+                                    batch_max = batch_max.max(ce_score.score);
+                                    max_ce_score = max_ce_score.max(ce_score.score);
+                                }
+                            }
+
+                            if ce_scores.len() >= early_term_min && batch_max < max_ce_score * 0.6 {
+                                tracing::debug!(
+                                    scored = ce_scores.len(),
+                                    total = scored.len(),
+                                    "Stage 2: early termination (CE)"
+                                );
+                                terminated_early = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Cross-encoder batch failed: {e}");
+                            for &(ci, idx, _) in &need_inference {
+                                let global_i = chunk_start + ci;
+                                if global_i < scored.len() {
+                                    ce_scores.push((idx, scored[global_i].1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            *scored = ce_scores;
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            tracing::debug!(
+                scored = scored.len(),
+                cache_hits,
+                early_term = terminated_early,
+                "Stage 2 complete (cross-encoder)"
+            );
+        }
+    }
+
     /// Run the full 5-stage pipeline on a set of candidates.
     pub fn rank(
         &self,
@@ -129,6 +327,57 @@ impl RankingPipeline {
     ) -> SearchResponse {
         let start = std::time::Instant::now();
         let query_type = query_type::detect_query_type(query);
+        let total_input = candidates.len();
+
+        // Stage 0: Query-term relevance gate (free filter, ~0ms).
+        // Reject candidates whose body text contains zero distinctive query terms.
+        // Catches obviously irrelevant pages (Reddit homepage, Wikipedia login, etc.)
+        // Filter out common English words that match too broadly.
+        const STOP_WORDS: &[&str] = &[
+            "the", "and", "for", "are", "what", "how", "why", "when", "where", "which",
+            "with", "from", "that", "this", "have", "has", "had", "will", "would", "could",
+            "should", "can", "not", "but", "its", "was", "were", "been", "being", "does",
+            "between", "about", "into", "over", "after", "before", "during", "each",
+            "differences", "difference", "compared", "comparison", "performance", "pricing",
+            "best", "most", "more", "less", "than", "very", "also", "other",
+            "workloads", "workload", "using", "used",
+        ];
+        let query_terms: Vec<String> = query
+            .split_whitespace()
+            .filter(|w| w.len() > 2)
+            .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
+            .collect();
+
+        let candidates: Vec<RankCandidate> = if query_terms.len() >= 2 {
+            let before = candidates.len();
+            // Require at least 30% of distinctive query terms (min 2) to appear in title+body
+            let min_hits = (query_terms.len() as f32 * 0.3).ceil().max(2.0) as usize;
+            let filtered: Vec<RankCandidate> = candidates
+                .into_iter()
+                .filter(|c| {
+                    let body_lower = c.body_text.to_lowercase();
+                    let title_lower = c.title.to_lowercase();
+                    let combined = format!("{} {}", title_lower, body_lower);
+                    let hits = query_terms.iter()
+                        .filter(|qt| combined.contains(qt.as_str()))
+                        .count();
+                    hits >= min_hits
+                })
+                .collect();
+            let removed = before - filtered.len();
+            if removed > 0 {
+                tracing::debug!(
+                    removed, kept = filtered.len(), min_hits,
+                    terms = ?query_terms,
+                    "Stage 0: query-term relevance gate"
+                );
+            }
+            filtered
+        } else {
+            candidates
+        };
+
         let total_input = candidates.len();
 
         tracing::info!(
@@ -172,112 +421,37 @@ impl RankingPipeline {
 
         tracing::debug!(stage1_results = scored.len(), "Stage 1 complete: RRF fusion");
 
-        // Stage 2: Cross-encoder rerank with score cache + early termination
+        // Stage 2: Rerank with ColBERT MaxSim (fast) or cross-encoder (fallback)
         //
-        // Cache: (query_hash, doc_hash) → blended score. Skips inference on cache hit.
-        // Early termination: after scoring top_k*2, stop if batch scores drop below 50% of max.
-        if let Some(reranker) = &self.reranker {
-            let query_hash = hash_str(query);
-            // Cross-encoder on top 15 only (was top_k*1.5). Two-phase funnel:
-            // Stage 1 (RRF) → 50, Stage 2 (CE) → 15, final → top_k
-            let early_term_min = 15.min(scored.len());
-            let batch_size = 8;
-            let mut ce_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
-            let mut max_ce_score = 0.0_f32;
-            let mut terminated_early = false;
-            let mut cache_hits = 0_usize;
-
-            for chunk_start in (0..scored.len()).step_by(batch_size) {
-                let chunk_end = (chunk_start + batch_size).min(scored.len());
-                let chunk = &scored[chunk_start..chunk_end];
-
-                // Separate cached vs uncached candidates
-                let mut need_inference: Vec<(usize, usize, String)> = Vec::new(); // (chunk_pos, global_idx, truncated)
-                for (ci, &(idx, isr_score)) in chunk.iter().enumerate() {
-                    let body = &candidates[idx].body_text;
-                    let truncated: String = body.chars().take(256).collect();
-                    let doc_hash = hash_str(&truncated);
-                    let cache_key = (query_hash, doc_hash);
-
-                    if let Some(cached) = self.score_cache.get(&cache_key) {
-                        let blended = 0.3 * isr_score + 0.7 * *cached;
-                        ce_scores.push((idx, blended));
-                        max_ce_score = max_ce_score.max(*cached);
-                        cache_hits += 1;
-                    } else {
-                        need_inference.push((ci, idx, truncated));
-                    }
-                }
-
-                // Run cross-encoder only for cache misses
-                if !need_inference.is_empty() {
-                    let pairs: Vec<(&str, &str)> = need_inference.iter()
-                        .map(|(_, _, doc)| (query, doc.as_str()))
-                        .collect();
-
-                    match reranker.score_pairs(&pairs) {
-                        Ok(scores) => {
-                            let mut batch_max = 0.0_f32;
-                            for (i, ce_score) in scores.iter().enumerate() {
-                                if i >= need_inference.len() { break; }
-                                let (ci, idx, ref truncated) = need_inference[i];
-                                let global_i = chunk_start + ci;
-                                if global_i < scored.len() {
-                                    // Cache the raw CE score
-                                    let doc_hash = hash_str(truncated);
-                                    self.score_cache.insert((query_hash, doc_hash), ce_score.score);
-
-                                    let blended = 0.3 * scored[global_i].1 + 0.7 * ce_score.score;
-                                    ce_scores.push((idx, blended));
-                                    batch_max = batch_max.max(ce_score.score);
-                                    max_ce_score = max_ce_score.max(ce_score.score);
-                                }
-                            }
-
-                            if ce_scores.len() >= early_term_min && batch_max < max_ce_score * 0.6 {
-                                tracing::debug!(
-                                    scored = ce_scores.len(),
-                                    total = scored.len(),
-                                    "Stage 2: early termination"
-                                );
-                                terminated_early = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Cross-encoder batch failed: {e}");
-                            for &(ci, idx, _) in &need_inference {
-                                let global_i = chunk_start + ci;
-                                if global_i < scored.len() {
-                                    ce_scores.push((idx, scored[global_i].1));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            scored = ce_scores;
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            tracing::debug!(
-                scored = scored.len(),
-                cache_hits,
-                early_term = terminated_early,
-                "Stage 2 complete"
-            );
+        // ColBERT: ~5-10ms for 50 docs (late interaction, pre-normalized token embeddings)
+        // Cross-encoder: ~8s for 50 docs (full attention, sequential pairs)
+        // Cache: (query_hash, doc_hash) → score. Skips inference on cache hit.
+        let used_colbert = self.stage2_colbert(&candidates, query, &mut scored);
+        if !used_colbert {
+            self.stage2_cross_encoder(&candidates, query, &mut scored);
         }
 
         let stage2_limit = self.config.rerank_top_k.min(scored.len());
         scored.truncate(stage2_limit);
 
-        // Filter out results below minimum relevance score
-        if self.config.min_relevance_score > 0.0 {
+        // Filter out results below minimum relevance score,
+        // but always keep at least top_k results as a safety floor.
+        if self.config.min_relevance_score > 0.0 && scored.len() > top_k {
             let before = scored.len();
-            scored.retain(|(_, score)| *score >= self.config.min_relevance_score);
+            let threshold = self.config.min_relevance_score;
+            // Keep results above threshold OR the top_k best results (whichever yields more)
+            let above_threshold: Vec<_> = scored.iter()
+                .filter(|(_, score)| *score >= threshold)
+                .cloned()
+                .collect();
+            if above_threshold.len() >= top_k {
+                scored = above_threshold;
+            } else {
+                scored.truncate(top_k.max(above_threshold.len()));
+            }
             let filtered = before - scored.len();
             if filtered > 0 {
-                tracing::debug!(filtered, threshold = self.config.min_relevance_score, "Low-relevance results removed");
+                tracing::debug!(filtered, threshold, kept = scored.len(), "Low-relevance filter (safety floor active)");
             }
         }
 
@@ -291,12 +465,33 @@ impl RankingPipeline {
             *score = freshness::authority_freshness_boost(*score, auth_mult, fresh_mult, query_type);
         }
 
+        // Stage 3b: Primary source boost — promote results from canonical/official domains
+        let official_domains = entity_domain::detect_official_domains(query);
+        if !official_domains.is_empty() {
+            let mut boosted_count = 0_usize;
+            for (idx, score) in scored.iter_mut() {
+                let c = &candidates[*idx];
+                let ps_boost = entity_domain::primary_source_boost(query, &c.domain, &official_domains);
+                if ps_boost > 1.0 {
+                    *score *= ps_boost;
+                    boosted_count += 1;
+                }
+            }
+            if boosted_count > 0 {
+                tracing::info!(
+                    boosted_count,
+                    official_domains = ?official_domains,
+                    "Primary source boost applied"
+                );
+            }
+        }
+
         // Re-sort after boost
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let stage3_limit = 30.min(scored.len());
         scored.truncate(stage3_limit);
 
-        // Stage 3b: Query anchor penalty — demote results that completely miss original query terms.
+        // Stage 3c: Query anchor penalty — demote results that completely miss original query terms.
         // This prevents query drift where reformulated queries (e.g. "B200") dilute results
         // for the original query (e.g. "NVIDIA H200 GPU specs").
         let query_words: Vec<String> = query

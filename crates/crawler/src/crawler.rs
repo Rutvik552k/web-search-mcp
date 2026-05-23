@@ -317,6 +317,7 @@ mod tests {
             enable_browser: false,
             max_retries: 1,
             backoff_base_ms: 100,
+            searxng_url: None,
         }
     }
 

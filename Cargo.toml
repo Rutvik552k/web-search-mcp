@@ -54,6 +54,15 @@ moka = { version = "0.12", features = ["future"] }
 # Binary serialization
 bincode = "1"
 
+# Persistent cache
+redb = "2"
+
+# Tokio utilities (CancellationToken for daemon)
+tokio-util = "0.7"
+
+# Streaming pipeline
+tokio-stream = "0.1"
+
 # Regex
 regex = "1"
 

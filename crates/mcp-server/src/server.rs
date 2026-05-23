@@ -41,6 +41,9 @@ impl WebSearchServer {
         // Start progress logger for long-running operations
         spawn_progress_logger(&engine);
 
+        // Start background crawl daemon — pre-indexes content before queries arrive
+        engine.start_daemon();
+
         tracing::info!("WebSearchServer initialized");
         Ok(Self { engine })
     }
@@ -62,6 +65,7 @@ impl ServerHandler for WebSearchServer {
                  to prevent LLM hallucination.\n\n\
                  Smart tools:\n\
                  - instant_search: Ultra-fast cached search (~1-2s)\n\
+                 - streaming_search: Progressive results (partial ~3s, refined ~10s)\n\
                  - deep_research: Multi-wave crawl + rank (thorough, 2min)\n\
                  - quick_search: Fast single-wave search (5-15s)\n\
                  - explore_topic: Discovery mode with entity graph\n\

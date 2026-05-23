@@ -12,6 +12,11 @@ pub fn build_schema() -> Schema {
     // Full-text searchable body (not stored to save space; original in page cache)
     builder.add_text_field("body", TEXT);
 
+    // SPLADE semantic expansion terms (not stored).
+    // Contains expanded vocabulary terms weighted by SPLADE model.
+    // BM25 on this field captures semantic similarity beyond lexical match.
+    builder.add_text_field("splade_body", TEXT);
+
     // Date field for freshness scoring
     builder.add_date_field("published_date", INDEXED | FAST | STORED);
 

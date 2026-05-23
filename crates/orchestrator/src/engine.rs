@@ -1,8 +1,10 @@
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use web_search_common::config::Config;
 use web_search_common::models::*;
 use web_search_common::Result;
+use crate::persistent_cache::PersistentCache;
 use crate::synthesis;
 use web_search_crawler::Crawler;
 use web_search_embedder::{self, Embedder};
@@ -34,6 +36,7 @@ struct QueryCacheEntry {
 }
 
 /// Cached extraction result for a URL — avoids re-crawling + re-extracting.
+#[derive(Clone)]
 struct CachedExtraction {
     candidate: RankCandidate,
     body_for_embed: String,
@@ -63,6 +66,12 @@ pub struct SearchEngine {
     /// URL → extracted content cache. Avoids re-crawling + re-extracting same URLs.
     /// TTL: 30 minutes. Eliminates most of the 8.3s crawl time on repeated queries.
     url_cache: dashmap::DashMap<String, CachedExtraction>,
+    /// Persistent disk cache (redb). Survives restarts.
+    persistent_cache: Option<Arc<PersistentCache>>,
+    /// Background flush task handle — flushes DashMap → redb every 30s.
+    _flush_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Background crawl daemon — pre-indexes content before queries arrive.
+    daemon: std::sync::OnceLock<crate::daemon::CrawlDaemon>,
 }
 
 impl SearchEngine {
@@ -104,6 +113,106 @@ impl SearchEngine {
 
         let (progress_tx, _) = tokio::sync::broadcast::channel(32);
 
+        // Open persistent cache (redb) — warm-load embeddings + CE scores into DashMap
+        let embedding_cache = dashmap::DashMap::new();
+        let cache_path = data_dir.join("cache.redb");
+        let persistent_cache = if !data_dir.as_os_str().is_empty() {
+            match PersistentCache::open(&cache_path) {
+                Ok(pc) => {
+                    // Warm-load embeddings
+                    match pc.load_embeddings() {
+                        Ok(entries) => {
+                            for (hash, vec) in entries {
+                                embedding_cache.insert(hash, vec);
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "Failed to load embeddings from disk"),
+                    }
+                    // Warm-load CE scores into ranker's DashMap
+                    match pc.load_scores() {
+                        Ok(entries) => {
+                            let sc = pipeline.score_cache();
+                            for (key, score) in &entries {
+                                sc.insert(*key, *score);
+                            }
+                            tracing::info!(scores = entries.len(), "Loaded CE scores from persistent cache");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "Failed to load CE scores from disk"),
+                    }
+                    if let Ok(stats) = pc.stats() {
+                        tracing::info!(
+                            embeddings = stats.embeddings,
+                            scores = stats.scores,
+                            urls = stats.urls,
+                            "Persistent cache stats"
+                        );
+                    }
+                    Some(Arc::new(pc))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to open persistent cache, running without");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Spawn background flush task (embeddings + CE scores → redb every 30s)
+        let _flush_handle = if let Some(ref pc) = persistent_cache {
+            let pc = Arc::clone(pc);
+            let emb_cache = embedding_cache.clone();
+            let score_cache = pipeline.score_cache().clone();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                let mut last_emb_count = 0_usize;
+                let mut last_score_count = 0_usize;
+                loop {
+                    interval.tick().await;
+
+                    // Flush new embeddings
+                    let cur_emb = emb_cache.len();
+                    if cur_emb > last_emb_count {
+                        let entries: Vec<(String, Vec<f32>)> = emb_cache
+                            .iter()
+                            .map(|r| (r.key().clone(), r.value().clone()))
+                            .collect();
+                        let pairs: Vec<(&str, &[f32])> = entries
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_slice()))
+                            .collect();
+                        if let Err(e) = pc.flush_embeddings(&pairs) {
+                            tracing::warn!(error = %e, "Flush embeddings failed");
+                        }
+                        last_emb_count = cur_emb;
+                    }
+
+                    // Flush new CE scores
+                    let cur_scores = score_cache.len();
+                    if cur_scores > last_score_count {
+                        let entries: Vec<((u64, u64), f32)> = score_cache
+                            .iter()
+                            .map(|r| (*r.key(), *r.value()))
+                            .collect();
+                        if let Err(e) = pc.flush_scores(&entries) {
+                            tracing::warn!(error = %e, "Flush CE scores failed");
+                        }
+                        last_score_count = cur_scores;
+                    }
+
+                    // Periodic eviction
+                    if let Err(e) = pc.evict_expired(10_000, 50_000, 4 * 3600) {
+                        tracing::warn!(error = %e, "Cache eviction failed");
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Note: daemon is spawned lazily via start_daemon() after SearchEngine
+        // is wrapped in Arc, since it needs Arc<Crawler> from the engine.
+
         Ok(Self {
             crawler,
             text_index,
@@ -114,8 +223,11 @@ impl SearchEngine {
             _config: config,
             progress_tx: Some(progress_tx),
             query_cache: tokio::sync::Mutex::new(Vec::new()),
-            embedding_cache: dashmap::DashMap::new(),
+            embedding_cache,
             url_cache: dashmap::DashMap::new(),
+            persistent_cache,
+            _flush_handle,
+            daemon: std::sync::OnceLock::new(),
         })
     }
 
@@ -130,6 +242,92 @@ impl SearchEngine {
         let _ = self.embedder.embed(&["warmup ping"]).await?;
         tracing::info!(elapsed_ms = start.elapsed().as_millis() as u64, "Embedder warmed up");
         Ok(())
+    }
+
+    /// Start the background crawl daemon.
+    ///
+    /// Must be called after the engine is wrapped in Arc.
+    /// Pages crawled by the daemon populate the URL cache so next query
+    /// hitting the same URL skips crawl entirely.
+    pub fn start_daemon(self: &Arc<Self>) {
+        use crate::daemon::CrawlDaemon;
+
+        let crawler = match Crawler::new(self._config.crawler.clone()) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create crawler for daemon");
+                return;
+            }
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let url_cache = self.url_cache.clone();
+
+        let daemon = CrawlDaemon::spawn(
+            crawler,
+            move |page| {
+                let extraction = web_search_extractor::consensus::extract_page(
+                    &page.body,
+                    &page.final_url,
+                );
+                if extraction.body_text.len() < 50 {
+                    return;
+                }
+
+                let domain = url::Url::parse(&page.final_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_default();
+                let source_tier = web_search_ranker::authority::classify_domain(&domain);
+
+                let candidate = web_search_ranker::pipeline::RankCandidate {
+                    url: page.final_url.clone(),
+                    domain,
+                    title: extraction.title.clone().unwrap_or_default(),
+                    body_text: extraction.body_text.clone(),
+                    published_date: extraction.published_date,
+                    source_tier,
+                    bm25_score: None,
+                    vector_score: None,
+                    bm25_rank: None,
+                    vector_rank: None,
+                    embedding: None,
+                };
+
+                url_cache.insert(
+                    page.final_url.clone(),
+                    CachedExtraction {
+                        candidate,
+                        body_for_embed: extraction.body_text,
+                        cached_at: Instant::now(),
+                    },
+                );
+
+                tracing::debug!(url = %page.final_url, "Daemon: pre-cached URL");
+            },
+            cancel,
+        );
+
+        let _ = self.daemon.set(daemon);
+        tracing::info!("Background crawl daemon started");
+    }
+
+    /// Feed discovered links to the background daemon for pre-indexing.
+    async fn enqueue_links_for_daemon(
+        &self,
+        pages: &[web_search_crawler::crawler::CrawledPage],
+    ) {
+        if let Some(daemon) = self.daemon.get() {
+            let urls: Vec<(String, crate::daemon::CrawlPriority)> = pages
+                .iter()
+                .flat_map(|p| p.links.iter())
+                .filter(|l| l.is_external)
+                .take(20) // cap to avoid flooding
+                .map(|l| (l.url.clone(), crate::daemon::CrawlPriority::HighQualityLink))
+                .collect();
+            if !urls.is_empty() {
+                daemon.enqueue_batch(urls).await;
+            }
+        }
     }
 
     /// Subscribe to progress updates for long-running operations.
@@ -171,7 +369,7 @@ impl SearchEngine {
         let query_variants = crate::query::reformulate_query(query);
         let seeds: Vec<String> = query_variants
             .iter()
-            .flat_map(|q| generate_search_seeds(q))
+            .flat_map(|q| generate_search_seeds(q, self._config.crawler.searxng_url.as_deref()))
             .collect();
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
         tracing::info!(seed_count = seeds.len(), variants = query_variants.len(), "Generated search seeds");
@@ -187,6 +385,9 @@ impl SearchEngine {
 
         // Process crawled pages (batch extract + batch embed)
         let mut candidates = self.process_pages_batch(&pages).await;
+
+        // Feed discovered links to background daemon for pre-indexing
+        self.enqueue_links_for_daemon(&pages).await;
 
         // Wave 2: Follow best links from wave 1 results
         if start.elapsed() < time_limit && candidates.len() < max_pages {
@@ -344,7 +545,7 @@ impl SearchEngine {
             "Adaptive quick search parameters"
         );
 
-        let seeds = generate_search_seeds(query);
+        let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
 
         let pages = self.crawler.crawl(
@@ -359,6 +560,7 @@ impl SearchEngine {
         let total_budget = Duration::from_secs(timeout_secs * 2);
 
         let mut candidates = self.process_pages_batch(&pages).await;
+        self.enqueue_links_for_daemon(&pages).await;
 
         if pipeline_start.elapsed() > total_budget && !candidates.is_empty() {
             // Over budget — skip full ranking, return basic results
@@ -433,7 +635,7 @@ impl SearchEngine {
         }
 
         // 2. Generate search seeds and crawl with tight limits
-        let seeds = generate_search_seeds(query);
+        let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
 
         let pages = self.crawler.crawl(
@@ -504,6 +706,97 @@ impl SearchEngine {
         );
 
         Ok(response)
+    }
+
+    /// Streaming search: returns progressive results via mpsc channel.
+    ///
+    /// Two-tier deadline:
+    /// - Partial results at 3s (lightly ranked, from fastest sources)
+    /// - Refined results at 10s (full pipeline: cross-encoder, verification, synthesis)
+    ///
+    /// Callers receive `SearchEvent`s and can display results as they arrive.
+    pub async fn streaming_search(
+        &self,
+        query: &str,
+        config: crate::streaming::StreamConfig,
+    ) -> tokio::sync::mpsc::Receiver<crate::streaming::SearchEvent> {
+        use crate::streaming::*;
+
+        let (tx, rx) = create_event_channel(16);
+        let start = Instant::now();
+
+        // Phase 1: fast crawl for partial results
+        emit_progress(&tx, "crawl", "fetching initial pages");
+
+        let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
+        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+
+        let pages = self.crawler.crawl(
+            &seed_refs,
+            15,  // small batch
+            0,   // no link-following
+            config.partial_deadline,
+        ).await;
+
+        emit_progress(&tx, "extract", &format!("processing {} pages", pages.len()));
+
+        // Quick extraction for partial results (no embedding/indexing)
+        let mut partial: Vec<RankedResult> = Vec::new();
+        for page in &pages {
+            let extraction = web_search_extractor::consensus::extract_page(&page.body, &page.final_url);
+            if extraction.body_text.len() < 50 { continue; }
+
+            let domain = extract_domain(&page.final_url);
+            let tier = web_search_ranker::authority::classify_domain(&domain);
+            partial.push(RankedResult {
+                content: web_search_extractor::extract_snippet(
+                    &extraction.body_text, query, 1500,
+                ),
+                url: page.final_url.clone(),
+                title: extraction.title.unwrap_or_default(),
+                confidence: extraction.extraction_confidence as f32 * 0.01,
+                verification: VerificationStatus::Unverified,
+                claims: vec![],
+                contradictions: vec![],
+                source_tier: tier,
+                freshness: extraction.published_date,
+                relevance_score: extraction.extraction_confidence as f32 * 0.01,
+            });
+        }
+        partial.truncate(config.partial_max);
+
+        // Emit partial results
+        if !partial.is_empty() {
+            emit_partial(&tx, partial, start);
+        }
+
+        // Phase 2: full pipeline for refined results (if time remains)
+        if !past_deadline(start, config.hard_deadline) {
+            emit_progress(&tx, "index", "embedding and indexing");
+
+            let mut candidates = self.process_pages_batch(&pages).await;
+            self.enqueue_links_for_daemon(&pages).await;
+
+            if !past_deadline(start, config.hard_deadline) {
+                self.text_index.commit().ok();
+                self.save_vectors();
+                self.apply_hybrid_ranks(&mut candidates, query).await;
+
+                emit_progress(&tx, "rank", "running ranking pipeline");
+                let mut response = self.pipeline.rank(candidates, query, config.final_max);
+                self.apply_synthesis(&mut response, query);
+
+                emit_refined(
+                    &tx,
+                    response.results,
+                    response.synthesis,
+                    start,
+                ).await;
+            }
+        }
+
+        emit_complete(&tx, pages.len(), start).await;
+        rx
     }
 
     /// Verify a claim by searching for supporting/contradicting evidence.
@@ -788,6 +1081,44 @@ impl SearchEngine {
         }
     }
 
+    /// Final flush of all in-memory caches to disk. Call on shutdown.
+    pub fn flush_to_disk(&self) {
+        self.save_vectors();
+
+        if let Some(ref pc) = self.persistent_cache {
+            // Flush embeddings
+            let entries: Vec<(String, Vec<f32>)> = self.embedding_cache
+                .iter()
+                .map(|r| (r.key().clone(), r.value().clone()))
+                .collect();
+            let pairs: Vec<(&str, &[f32])> = entries
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect();
+            if let Err(e) = pc.flush_embeddings(&pairs) {
+                tracing::warn!(error = %e, "Shutdown: flush embeddings failed");
+            }
+
+            // Flush CE scores
+            let scores: Vec<((u64, u64), f32)> = self.pipeline.score_cache()
+                .iter()
+                .map(|r| (*r.key(), *r.value()))
+                .collect();
+            if let Err(e) = pc.flush_scores(&scores) {
+                tracing::warn!(error = %e, "Shutdown: flush CE scores failed");
+            }
+
+            if let Ok(stats) = pc.stats() {
+                tracing::info!(
+                    embeddings = stats.embeddings,
+                    scores = stats.scores,
+                    urls = stats.urls,
+                    "Shutdown: persistent cache flushed"
+                );
+            }
+        }
+    }
+
     /// Apply hybrid BM25 + vector ranks to candidates after indexing.
     ///
     /// Queries both tantivy (BM25) and HNSW (vector) indexes,
@@ -1013,7 +1344,7 @@ impl SearchEngine {
             crawled.body.len(),
         );
 
-        if let Err(e) = self.text_index.add_page(&page) {
+        if let Err(e) = self.text_index.add_page(&page, None) {
             tracing::warn!(url = %crawled.final_url, error = %e, "Index add failed");
         }
 
@@ -1061,13 +1392,40 @@ impl SearchEngine {
 ///
 /// Uses multiple search engines and direct knowledge sources to maximize
 /// coverage without relying on any single API.
-fn generate_search_seeds(query: &str) -> Vec<String> {
+fn generate_search_seeds(query: &str, searxng_url: Option<&str>) -> Vec<String> {
     let encoded = urlencoding_simple(query);
     let _encoded_dash = query.to_lowercase().replace(' ', "-");
     let encoded_underscore = query.to_lowercase().replace(' ', "_");
 
-    let mut seeds = vec![
-        // Major search engines
+    let mut seeds = Vec::new();
+
+    // SearXNG metasearch — primary source when configured.
+    // Aggregates Google+Bing+DDG in one request, returns clean JSON, no CAPTCHA.
+    // Self-hosted: docker run -d -p 8080:8080 searxng/searxng
+    if let Some(base) = searxng_url {
+        let base = base.trim_end_matches('/');
+        // Query across multiple categories for maximum coverage
+        seeds.push(format!("{base}/search?q={encoded}&format=json&categories=general&pageno=1"));
+        seeds.push(format!("{base}/search?q={encoded}&format=json&categories=general&pageno=2"));
+        seeds.push(format!("{base}/search?q={encoded}&format=json&categories=science"));
+        seeds.push(format!("{base}/search?q={encoded}&format=json&categories=it"));
+        seeds.push(format!("{base}/search?q={encoded}&format=json&categories=news"));
+    }
+
+    // Fallback public SearXNG instances (may 403 — best-effort)
+    if searxng_url.is_none() {
+        for instance in &[
+            "https://search.sapti.me",
+            "https://searx.tiekoetter.com",
+            "https://search.inetol.net",
+            "https://searx.be",
+        ] {
+            seeds.push(format!("{instance}/search?q={encoded}&format=json&categories=general"));
+        }
+    }
+
+    seeds.extend([
+        // Major search engines (fallback — often blocked/JS-rendered)
         format!("https://www.google.com/search?q={encoded}&num=20"),
         format!("https://www.bing.com/search?q={encoded}&count=20"),
         // Alternative search engines (HTML versions, no API key)
@@ -1085,10 +1443,14 @@ fn generate_search_seeds(query: &str) -> Vec<String> {
         format!("https://arxiv.org/search/?query={encoded}&searchtype=all"),
         // Hacker News — use Algolia API (returns JSON, SPA frontend is unscrapable)
         format!("https://hn.algolia.com/api/v1/search?query={encoded}&tags=story"),
-        // SearXNG metasearch — aggregates Google/Bing/DDG without CAPTCHA (JSON API)
-        format!("https://search.sapti.me/search?q={encoded}&format=json&categories=general"),
-        format!("https://searx.tiekoetter.com/search?q={encoded}&format=json&categories=general"),
-    ];
+    ]);
+
+    // Add official/canonical domain seeds for detected entities
+    let official_domains = web_search_ranker::entity_domain::detect_official_domains(query);
+    for domain in &official_domains {
+        // Site-specific search on Google to find relevant pages on the official domain
+        seeds.insert(0, format!("https://www.google.com/search?q=site%3A{domain}+{encoded}"));
+    }
 
     // Add topic-specific sources based on query keywords
     let q = query.to_lowercase();
@@ -1214,13 +1576,19 @@ fn extract_domain(url: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+impl Drop for SearchEngine {
+    fn drop(&mut self) {
+        self.flush_to_disk();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn generate_seeds_produces_urls() {
-        let seeds = generate_search_seeds("rust programming language");
+        let seeds = generate_search_seeds("rust programming language", None);
         assert!(seeds.len() >= 5, "Should generate multiple seed URLs");
         // Should include major search engines
         let all = seeds.join(" ");
@@ -1249,8 +1617,8 @@ mod tests {
         assert_eq!(extract_domain("invalid"), "unknown");
     }
 
-    #[test]
-    fn engine_creates_with_default_config() {
+    #[tokio::test]
+    async fn engine_creates_with_default_config() {
         let config = Config::default();
         let engine = SearchEngine::new(config);
         assert!(engine.is_ok());

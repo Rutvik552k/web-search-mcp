@@ -8,6 +8,11 @@ respect_robots_txt = true
 enable_browser = false
 max_retries = 3
 backoff_base_ms = 1000
+# SearXNG metasearch instance URL (optional but recommended).
+# Aggregates Google+Bing+DDG results via JSON API — no CAPTCHA, no bot detection.
+# Setup: docker run -d -p 8080:8080 searxng/searxng
+# Then enable JSON format in settings.yml: search.formats = ["json"]
+searxng_url = "http://localhost:8080"
 
 [extractor]
 enable_ml_classifier = false
@@ -41,7 +46,7 @@ mmr_lambda = 0.7
 max_results_per_domain = 2
 min_unique_orgs = 3
 source_tiers_path = "config/source_tiers.toml"
-min_relevance_score = 0.35
+min_relevance_score = 0.05
 
 [server]
 name = "web-search-mcp"

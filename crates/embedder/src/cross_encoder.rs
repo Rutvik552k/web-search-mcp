@@ -24,10 +24,18 @@ mod inner {
         model_id: String,
         max_seq_len: usize,
         num_labels: usize,
-        /// Classification head: weight matrix [num_labels, hidden_size]
+        /// Final projection: weight matrix [num_labels, hidden_size]
         classifier_weight: Tensor,
-        /// Classification head: bias vector [num_labels]
+        /// Final projection: bias vector [num_labels]
         classifier_bias: Tensor,
+        /// Optional dense pre-projection for MLP classification heads (NLI models).
+        /// When present: logits = out_proj(tanh(dense(cls_output)))
+        classifier_dense: Option<Tensor>,
+        classifier_dense_bias: Option<Tensor>,
+        /// BERT pooler: tanh(dense(cls_hidden_state)). Applied before classifier.
+        /// BertForSequenceClassification uses this; candle's BertModel doesn't include it.
+        pooler_weight: Option<Tensor>,
+        pooler_bias: Option<Tensor>,
         /// Label index mapping for NLI: label_name → index
         id2label: std::collections::HashMap<usize, String>,
     }
@@ -129,25 +137,67 @@ mod inner {
             // Load classification head: classifier.weight [num_labels, hidden_size]
             // and classifier.bias [num_labels]. These are NOT part of candle's BertModel.
             let hidden_size = bert_config.hidden_size;
-            let (classifier_weight, classifier_bias) = match (
-                vb_head.get((num_labels, hidden_size), "classifier.weight"),
-                vb_head.get(num_labels, "classifier.bias"),
+            // Load classification head. Two architectures:
+            // 1. Single linear: classifier.weight [num_labels, hidden] (ms-marco reranker)
+            // 2. Two-layer MLP: classifier.dense [hidden, hidden] + classifier.out_proj [num_labels, hidden] (NLI models)
+            //
+            // For architecture 2, we compose into a single effective weight matrix:
+            // out_proj @ tanh(dense @ x + dense_bias) + out_proj_bias
+            // But for simplicity, we just load the out_proj (final projection) and
+            // apply dense+tanh as a pre-step in scoring.
+            let (classifier_weight, classifier_bias, classifier_dense, classifier_dense_bias) = {
+                let cls = vb_head.pp("classifier");
+
+                // Try single-linear first: classifier.weight [num_labels, hidden]
+                let single_w = vb_head.get((num_labels, hidden_size), "classifier.weight");
+                let single_b = vb_head.get(num_labels, "classifier.bias");
+
+                if let (Ok(w), Ok(b)) = (single_w, single_b) {
+                    tracing::info!("Classification head loaded (single linear): [{num_labels}, {hidden_size}]");
+                    (w, b, None, None)
+                } else {
+                    // Try two-layer MLP: classifier.dense + classifier.out_proj
+                    let dense_w = cls.get((hidden_size, hidden_size), "dense.weight");
+                    let dense_b = cls.get(hidden_size, "dense.bias");
+                    let proj_w = cls.get((num_labels, hidden_size), "out_proj.weight");
+                    let proj_b = cls.get(num_labels, "out_proj.bias");
+
+                    match (dense_w, dense_b, proj_w, proj_b) {
+                        (Ok(dw), Ok(db), Ok(pw), Ok(pb)) => {
+                            tracing::info!(
+                                "Classification head loaded (MLP): dense [{hidden_size}, {hidden_size}] + out_proj [{num_labels}, {hidden_size}]"
+                            );
+                            (pw, pb, Some(dw), Some(db))
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "Classification head not found — using random init. Scores WILL be degraded."
+                            );
+                            let w = Tensor::randn(0f32, 0.02, (num_labels, hidden_size), &device)
+                                .map_err(|e| Error::Embedding(format!("init weight: {e}")))?;
+                            let b = Tensor::zeros(num_labels, DType::F32, &device)
+                                .map_err(|e| Error::Embedding(format!("init bias: {e}")))?;
+                            (w, b, None, None)
+                        }
+                    }
+                }
+            };
+
+            // Load BERT pooler: bert.pooler.dense.weight [hidden, hidden] + bias.
+            // BertForSequenceClassification applies pooler(cls) before classifier.
+            // Candle's BertModel doesn't include it.
+            let pooler = vb_head.pp("bert").pp("pooler").pp("dense");
+            let (pooler_weight, pooler_bias) = match (
+                pooler.get((hidden_size, hidden_size), "weight"),
+                pooler.get(hidden_size, "bias"),
             ) {
                 (Ok(w), Ok(b)) => {
-                    tracing::info!("Classification head loaded: [{num_labels}, {hidden_size}]");
-                    (w, b)
+                    tracing::info!("Pooler loaded: [{hidden_size}, {hidden_size}]");
+                    (Some(w), Some(b))
                 }
                 _ => {
-                    // Fallback: random init (should not happen with proper model files)
-                    tracing::warn!(
-                        "Classification head not found in weights — scores will be degraded. \
-                         Expected classifier.weight [{num_labels}, {hidden_size}] and classifier.bias [{num_labels}]"
-                    );
-                    let w = Tensor::randn(0f32, 0.02, (num_labels, hidden_size), &device)
-                        .map_err(|e| Error::Embedding(format!("init classifier weight: {e}")))?;
-                    let b = Tensor::zeros(num_labels, DType::F32, &device)
-                        .map_err(|e| Error::Embedding(format!("init classifier bias: {e}")))?;
-                    (w, b)
+                    tracing::debug!("No pooler weights found (may be intentional)");
+                    (None, None)
                 }
             };
 
@@ -155,6 +205,7 @@ mod inner {
                 model = model_id,
                 num_labels,
                 max_seq = bert_config.max_position_embeddings,
+                has_pooler = pooler_weight.is_some(),
                 "Cross-encoder loaded with classification head"
             );
 
@@ -167,6 +218,10 @@ mod inner {
                 num_labels,
                 classifier_weight,
                 classifier_bias,
+                classifier_dense,
+                classifier_dense_bias,
+                pooler_weight,
+                pooler_bias,
                 id2label,
             })
         }
@@ -228,17 +283,48 @@ mod inner {
                 .map_err(|e| Error::Embedding(format!("forward: {e}")))?;
 
             // Extract [CLS] token hidden state: [batch, hidden_size]
-            let cls_output = output
+            let cls_raw = output
                 .narrow(1, 0, 1)
                 .and_then(|t| t.squeeze(1))
                 .map_err(|e| Error::Embedding(format!("cls extract: {e}")))?;
 
-            // Apply classification head: logits = cls @ weight^T + bias
-            // cls_output: [batch, hidden_size], weight: [num_labels, hidden_size]
-            // Result: [batch, num_labels]
+            // Apply pooler if present: pooled = tanh(dense(cls_raw))
+            // BertForSequenceClassification applies this before the classifier.
+            let cls_output = if let (Some(pw), Some(pb)) =
+                (&self.pooler_weight, &self.pooler_bias)
+            {
+                let pw_t = pw.t()
+                    .map_err(|e| Error::Embedding(format!("transpose pooler: {e}")))?;
+                cls_raw
+                    .matmul(&pw_t)
+                    .and_then(|t| t.broadcast_add(pb))
+                    .and_then(|t| t.tanh())
+                    .map_err(|e| Error::Embedding(format!("pooler: {e}")))?
+            } else {
+                cls_raw
+            };
+
+            // Apply classification head.
+            // Single linear: logits = cls @ weight^T + bias
+            // MLP (NLI): logits = out_proj(tanh(dense(cls) + dense_bias))
+            let head_input = if let (Some(dense_w), Some(dense_b)) =
+                (&self.classifier_dense, &self.classifier_dense_bias)
+            {
+                // MLP path: dense projection + tanh activation
+                let dense_wt = dense_w.t()
+                    .map_err(|e| Error::Embedding(format!("transpose dense: {e}")))?;
+                cls_output
+                    .matmul(&dense_wt)
+                    .and_then(|t| t.broadcast_add(dense_b))
+                    .and_then(|t| t.tanh())
+                    .map_err(|e| Error::Embedding(format!("dense layer: {e}")))?
+            } else {
+                cls_output
+            };
+
             let weight_t = self.classifier_weight.t()
                 .map_err(|e| Error::Embedding(format!("transpose classifier weight: {e}")))?;
-            let logits_tensor = cls_output
+            let logits_tensor = head_input
                 .matmul(&weight_t)
                 .and_then(|t| t.broadcast_add(&self.classifier_bias))
                 .map_err(|e| Error::Embedding(format!("classifier head: {e}")))?;
@@ -251,7 +337,10 @@ mod inner {
                     .unwrap_or_else(|_| vec![0.0; self.num_labels]);
 
                 let score = if self.num_labels == 1 {
-                    // Reranking: single logit → sigmoid
+                    // Reranking: use raw logit directly for ranking.
+                    // ms-marco models use Identity activation (not sigmoid).
+                    // Raw logits give better discrimination (e.g., +8.6 vs -4.3).
+                    // Normalize to [0,1] via sigmoid only for display/caching.
                     sigmoid(logits[0])
                 } else {
                     // NLI: softmax → entailment probability

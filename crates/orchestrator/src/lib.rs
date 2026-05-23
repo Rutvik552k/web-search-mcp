@@ -1,5 +1,8 @@
+pub mod daemon;
 pub mod engine;
+pub mod persistent_cache;
 pub mod query;
+pub mod streaming;
 pub mod synthesis;
 pub mod tools;
 

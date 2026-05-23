@@ -33,6 +33,11 @@ pub struct CrawlerConfig {
     pub max_retries: u32,
     /// Backoff base in milliseconds for retries
     pub backoff_base_ms: u64,
+    /// SearXNG instance URL for metasearch (e.g., "http://localhost:8080").
+    /// When set, used as primary search source (JSON API, no CAPTCHA).
+    /// Run: docker run -d -p 8080:8080 searxng/searxng
+    #[serde(default)]
+    pub searxng_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +138,7 @@ impl Default for Config {
                 enable_browser: false,
                 max_retries: 3,
                 backoff_base_ms: 1000,
+                searxng_url: None,
             },
             extractor: ExtractorConfig {
                 enable_ml_classifier: false,

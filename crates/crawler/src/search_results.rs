@@ -31,8 +31,11 @@ pub fn parse_search_results(url: &str, html: &str) -> Option<Vec<SearchResult>> 
         d if d.contains("hn.algolia.com") || d.contains("algolia.com") => Some("hackernews"),
         d if d.contains("scholar.google.com") => Some("scholar"),
         d if d.contains("pubmed.ncbi.nlm.nih.gov") => Some("pubmed"),
-        // SearXNG metasearch instances (JSON API)
-        d if url.contains("format=json") && (d.contains("searx") || d.contains("search.")) => Some("searxng"),
+        // SearXNG metasearch instances (JSON API) — public or self-hosted
+        d if url.contains("format=json") && (
+            d.contains("searx") || d.contains("search.") ||
+            d == "localhost" || d.starts_with("127.0.0.1") || d.starts_with("192.168.")
+        ) => Some("searxng"),
         _ => None,
     };
 
@@ -82,12 +85,19 @@ fn parse_google(html: &str) -> Vec<SearchResult> {
 
     // Strategy 1: result blocks — Google wraps results in divs with class "g"
     // or data-attrid attributes. Links inside typically point to external sites.
+    // 2025-2026 update: Google added data-hveid, jsname attributes on result links.
     let selectors = [
         "div.g a[href]",
         "div.tF2Cxc a[href]",
         "div.yuRUbf a[href]",
         "a[data-ved][href]",
         "div[data-sokoban-container] a[href]",
+        // 2025-2026 patterns
+        "a[jsname][data-ved][href]",
+        "div[data-hveid] a[href]",
+        "a[ping][href]",
+        // Broad: any link with data-ved (Google tracking attribute)
+        "[data-ved] a[href]",
     ];
 
     for sel_str in &selectors {
@@ -153,11 +163,17 @@ fn parse_bing(html: &str) -> Vec<SearchResult> {
     let mut seen = HashSet::new();
 
     // Strategy 1: Bing algo results
+    // 2025-2026 update: Bing uses additional containers and data attributes.
     let selectors = [
         "li.b_algo h2 a[href]",
         "li.b_algo a[href]",
         "ol#b_results li a[href]",
         ".b_title a[href]",
+        // 2025-2026 patterns
+        ".b_algo .tilk a[href]",
+        "li.b_algo cite + a[href]",
+        "#b_results .b_algo a[h]",
+        "h2 a[href^='http']",
     ];
 
     for sel_str in &selectors {
@@ -314,9 +330,12 @@ fn parse_duckduckgo(html: &str) -> Vec<SearchResult> {
         // Newer DDG lite: links inside result divs
         ".results .result a[href]",
         ".web-result a.result__a[href]",
-        // DDG HTML lite version: table-based layout
+        // DDG HTML lite: table-based layout (2025-2026)
         "td.result-link a[href]",
         ".links_main a[href]",
+        // DDG lite uses <table> inside <center> with links in <td>
+        "center table a[href]",
+        "table.t a[href]",
         // Zero-click result
         ".zci__main a[href]",
         // Additional fallback patterns
@@ -864,16 +883,43 @@ fn extract_all_external_links(
     let mut results = Vec::new();
 
     for el in doc.select(&a_sel) {
-        let href = match el.value().attr("href") {
-            Some(h) if h.starts_with("http") => h,
+        let raw_href = match el.value().attr("href") {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Resolve the actual URL:
+        // 1. Google /url?q=REAL_URL redirect pattern
+        // 2. Bing /ck/a?!&&p=...&u=REAL_URL redirect pattern
+        // 3. Direct http(s) links
+        let actual_url = if raw_href.contains("/url?") && raw_href.contains("q=") {
+            // Google redirect
+            raw_href.split("q=")
+                .nth(1)
+                .and_then(|u| u.split('&').next())
+                .and_then(|u| urlencoding_decode(u))
+        } else if raw_href.contains("&u=") && raw_href.contains("bing.com") {
+            // Bing redirect
+            raw_href.split("&u=")
+                .nth(1)
+                .and_then(|u| u.split('&').next())
+                .and_then(|u| urlencoding_decode(u))
+        } else if raw_href.starts_with("http") {
+            Some(raw_href.to_string())
+        } else {
+            continue;
+        };
+
+        let url = match actual_url {
+            Some(u) if u.starts_with("http") => u,
             _ => continue,
         };
 
-        if href.contains(own_domain) || is_noise_url(href) {
+        if url.contains(own_domain) || is_noise_url(&url) {
             continue;
         }
 
-        if !seen.insert(href.to_string()) {
+        if !seen.insert(url.clone()) {
             continue;
         }
 
@@ -883,13 +929,13 @@ fn extract_all_external_links(
         }
 
         results.push(SearchResult {
-            url: href.to_string(),
+            url,
             title,
             snippet: String::new(),
         });
     }
 
-    results.truncate(15);
+    results.truncate(20);
     results
 }
 

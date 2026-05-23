@@ -37,6 +37,71 @@ pub async fn dispatch_tool(
             Ok(serde_json::to_string_pretty(&response)?)
         }
 
+        "streaming_search" => {
+            let query = get_str(args, "query")?;
+            let max_results = get_u64(args, "max_results").unwrap_or(10) as usize;
+
+            let config = crate::streaming::StreamConfig {
+                final_max: max_results,
+                ..Default::default()
+            };
+
+            let mut rx = engine.streaming_search(&query, config).await;
+
+            // Collect all events into a combined response
+            let mut partial_results = Vec::new();
+            let mut final_results = Vec::new();
+            let mut synthesis = Vec::new();
+            let mut total_pages = 0_usize;
+            let mut total_time_ms = 0_u64;
+            let mut events = Vec::new();
+
+            while let Some(event) = rx.recv().await {
+                match event {
+                    crate::streaming::SearchEvent::PartialResults { results, elapsed_ms } => {
+                        partial_results = results;
+                        events.push(serde_json::json!({
+                            "type": "partial",
+                            "count": partial_results.len(),
+                            "elapsed_ms": elapsed_ms,
+                        }));
+                    }
+                    crate::streaming::SearchEvent::RefinedResults { results, synthesis: syn, elapsed_ms } => {
+                        final_results = results;
+                        synthesis = syn;
+                        events.push(serde_json::json!({
+                            "type": "refined",
+                            "count": final_results.len(),
+                            "elapsed_ms": elapsed_ms,
+                        }));
+                    }
+                    crate::streaming::SearchEvent::Progress { stage, detail } => {
+                        events.push(serde_json::json!({
+                            "type": "progress",
+                            "stage": stage,
+                            "detail": detail,
+                        }));
+                    }
+                    crate::streaming::SearchEvent::Complete { total_pages_crawled, total_time_ms: t } => {
+                        total_pages = total_pages_crawled;
+                        total_time_ms = t;
+                    }
+                }
+            }
+
+            // Use refined results if available, otherwise partial
+            let results = if !final_results.is_empty() { &final_results } else { &partial_results };
+
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "results": results,
+                "synthesis": synthesis,
+                "total_pages_crawled": total_pages,
+                "total_time_ms": total_time_ms,
+                "pipeline_events": events,
+            }))?)
+        }
+
         "explore_topic" => {
             let topic = get_str(args, "topic")?;
             // explore_topic uses deep_research with wide breadth

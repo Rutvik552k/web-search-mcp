@@ -84,18 +84,20 @@ impl TextIndex {
         })
     }
 
-    /// Index a page.
-    pub fn add_page(&self, page: &Page) -> Result<u64> {
+    /// Index a page. Optional `splade_terms` adds SPLADE semantic expansion.
+    pub fn add_page(&self, page: &Page, splade_terms: Option<&str>) -> Result<u64> {
         let url_field = self.schema.get_field("url").unwrap();
         let title_field = self.schema.get_field("title").unwrap();
         let domain_field = self.schema.get_field("domain").unwrap();
         let body_field = self.schema.get_field("body").unwrap();
+        let splade_field = self.schema.get_field("splade_body").unwrap();
         let content_hash_field = self.schema.get_field("content_hash").unwrap();
         let source_tier_field = self.schema.get_field("source_tier").unwrap();
         let confidence_field = self.schema.get_field("extraction_confidence").unwrap();
         let indexed_at_field = self.schema.get_field("indexed_at").unwrap();
 
         let title = page.title.as_deref().unwrap_or("");
+        let splade = splade_terms.unwrap_or("");
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -107,6 +109,7 @@ impl TextIndex {
             title_field => title,
             domain_field => page.domain.as_str(),
             body_field => page.body_text.as_str(),
+            splade_field => splade,
             content_hash_field => page.content_hash.as_bytes(),
             source_tier_field => 4u64, // default tier 4, can be updated
             confidence_field => page.metadata.extraction_confidence as f64,
@@ -137,8 +140,10 @@ impl TextIndex {
         let source_tier_field = self.schema.get_field("source_tier").unwrap();
         let indexed_at_field = self.schema.get_field("indexed_at").unwrap();
 
+        let splade_field = self.schema.get_field("splade_body").unwrap();
+
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(&self.index, vec![title_field, body_field]);
+        let query_parser = QueryParser::for_index(&self.index, vec![title_field, body_field, splade_field]);
 
         let query = query_parser
             .parse_query(query_str)
@@ -253,8 +258,8 @@ mod tests {
             "Python is a high-level interpreted language used for data science",
         );
 
-        idx.add_page(&page1).unwrap();
-        idx.add_page(&page2).unwrap();
+        idx.add_page(&page1, None).unwrap();
+        idx.add_page(&page2, None).unwrap();
         idx.commit().unwrap();
 
         assert_eq!(idx.num_docs(), 2);
@@ -275,7 +280,7 @@ mod tests {
         ];
 
         for p in &pages {
-            idx.add_page(p).unwrap();
+            idx.add_page(p, None).unwrap();
         }
         idx.commit().unwrap();
 

@@ -29,5 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = server.serve(transport).await?;
     service.waiting().await?;
 
+    tracing::info!("MCP server shutting down — flushing caches to disk");
+    // Drop triggers flush_to_disk via SearchEngine's Drop impl
+
     Ok(())
 }

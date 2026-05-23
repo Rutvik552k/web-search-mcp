@@ -7,6 +7,12 @@ mod onnx_embedder;
 #[cfg(feature = "onnx")]
 pub mod onnx_cross_encoder;
 
+#[cfg(feature = "onnx")]
+pub mod colbert;
+
+#[cfg(feature = "onnx")]
+pub mod splade;
+
 #[cfg(feature = "candle")]
 mod candle_embedder;
 

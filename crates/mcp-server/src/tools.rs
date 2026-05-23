@@ -79,6 +79,18 @@ pub fn tool_definitions() -> Vec<Tool> {
                 "required": ["urls", "aspect"]
             }),
         ),
+        make_tool(
+            "streaming_search",
+            "Progressive search: returns partial results fast (~3s), then refined results with full ranking (~10s). Best when you want results ASAP.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "max_results": { "type": "integer", "default": 10, "description": "Max final results" }
+                },
+                "required": ["query"]
+            }),
+        ),
         // ── Atomic Tools (fine-grained control) ──────────────────────────
         make_tool(
             "fetch_page",

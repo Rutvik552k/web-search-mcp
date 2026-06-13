@@ -1,0 +1,6 @@
+# SAMPLE — format reference only. The operator's real file is benchmark/urls.jsonl
+# (same format, no comment lines needed). Blank lines and lines starting with
+# '#' or '//' are ignored by the harness.
+{"url": "https://example.com/", "tier": "static", "blocked": false, "expect_contains": "Example Domain"}
+{"url": "https://spa.example.com/app", "tier": "spa", "blocked": false}
+{"url": "https://protected.example.com/article", "tier": "cloudflare", "blocked": true, "expect_contains": "premium insight"}

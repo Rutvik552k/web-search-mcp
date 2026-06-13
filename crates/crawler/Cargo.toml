@@ -9,6 +9,10 @@ browser = ["chromiumoxide"]
 
 [dependencies]
 web-search-common = { workspace = true }
+# R0 in-band hydration salvage (Design 0005 §2.3). The extractor crate has NO
+# crawler dependency, so this edge is acyclic; `hydration::extract` is a pure,
+# zero-network function over a body we already hold.
+web-search-extractor = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
@@ -17,6 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 crossbeam = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }

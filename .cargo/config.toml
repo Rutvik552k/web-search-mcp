@@ -1,0 +1,7 @@
+# Windows GNU toolchain: the rustup-bundled mingw lacks libktmw32.a, so linking
+# (cargo test/build, esp. with the `browser` feature) fails with `cannot find -lktmw32`.
+# scoop's gcc ships it. Pin the search path so builds/tests work without a manual
+# RUSTFLAGS override. See memory: windows-browser-build-linker-flag.
+# If the scoop gcc version bumps from 15.2.0, update this path.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-L", "C:\\Users\\rutvi\\scoop\\apps\\gcc\\15.2.0\\x86_64-w64-mingw32\\lib"]

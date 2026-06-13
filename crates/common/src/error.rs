@@ -61,6 +61,31 @@ pub enum Error {
         limit_secs: u64,
     },
 
+    // CAPTCHA solver (R5 — Design 0004 Part 2, ADR 0003 R5).
+    // `reason` is a sanitized, secret-free description (provider error code/text,
+    // "timeout", "cost cap exceeded", etc.). The API key and the solved token are
+    // NEVER placed in this message (api-security ERROR HANDLING + NO SECRETS IN
+    // LOGS; llm-safety NO SECRETS IN PROMPTS).
+    #[error("captcha solve failed via {provider}: {reason}")]
+    Captcha { provider: String, reason: String },
+
+    // Hybrid escalation controller (Design 0005 H6 / ADR 0001 C4 / ADR 0003 C4).
+    // `vendor` is the challenge vendor name (e.g. "cloudflare", "datadome",
+    // "turnstile") — never a secret/cookie/token. Returned when the controller
+    // climbed to the solver/stealth rung and still could not clear the
+    // challenge. Distinct from `Blocked` (a raw status) so callers can tell
+    // "we tried to solve and failed" from "the origin returned an error".
+    #[error("challenge unsolved for {url} (vendor {vendor})")]
+    ChallengeUnsolved { url: String, vendor: String },
+
+    // Returned when a live-origin fetch is REFUSED because the domain is on the
+    // permanent denylist (ADR 0003 §4.2 single-IP hard-stop). Lets callers
+    // distinguish "we deliberately never contacted this origin" from "we tried
+    // and were blocked". `reason` is a fixed enum-ish label
+    // (e.g. "hard-ban", "explicit-block", "cease-and-desist") — never a secret.
+    #[error("permanently denied: {domain} ({reason})")]
+    PermanentlyDenied { domain: String, reason: String },
+
     // General
     #[error("config error: {0}")]
     Config(String),

@@ -243,6 +243,74 @@ impl Crawler {
         })
     }
 
+    /// Fetch multiple URLs concurrently, bypassing the frontier queue.
+    ///
+    /// Used for fast-path: when we already know the target URLs (from SearXNG),
+    /// skip the frontier's domain-limiting and priority queue overhead.
+    /// All URLs are fetched in parallel with a concurrency cap.
+    pub async fn fetch_urls_concurrent(
+        &self,
+        urls: &[&str],
+        timeout: Duration,
+    ) -> Vec<CrawledPage> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let start = Instant::now();
+        let mut futures = FuturesUnordered::new();
+        let mut crawled = Vec::new();
+
+        let per_request_timeout = timeout.min(Duration::from_secs(4));
+
+        for url in urls {
+            let fetcher = self.fetcher.clone();
+            let url = url.to_string();
+            let req_timeout = per_request_timeout;
+            futures.push(tokio::spawn(async move {
+                // Per-request timeout — don't let one slow URL block the batch
+                match tokio::time::timeout(req_timeout, fetcher.fetch(&url)).await {
+                    Ok(Ok(result)) => {
+                        let links = link_extractor::extract_links(&result.body, &result.final_url);
+                        Some(CrawledPage {
+                            url: url.clone(),
+                            final_url: result.final_url,
+                            body: result.body,
+                            content_type: result.content_type,
+                            status: result.status,
+                            response_time_ms: result.response_time_ms,
+                            depth: 0,
+                            is_spa: result.is_spa,
+                            links,
+                        })
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(url = %url, error = %e, "Concurrent fetch failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(url = %url, "Concurrent fetch timed out");
+                        None
+                    }
+                }
+            }));
+        }
+
+        while let Some(result) = futures.next().await {
+            if start.elapsed() >= timeout { break; }
+            if let Ok(Some(page)) = result {
+                crawled.push(page);
+            }
+        }
+
+        tracing::info!(
+            fetched = crawled.len(),
+            requested = urls.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "Concurrent fetch complete"
+        );
+
+        crawled
+    }
+
     /// Follow pagination from a starting URL.
     pub async fn paginate(&self, start_url: &str, max_pages: u32) -> Vec<CrawledPage> {
         let mut pages = Vec::new();
@@ -307,6 +375,8 @@ mod tests {
     use super::*;
 
     fn test_config() -> CrawlerConfig {
+        // Spread from Default so additive config fields (e.g. the Design 0005
+        // escalation block) don't require touching this helper.
         CrawlerConfig {
             num_workers: 2,
             max_concurrent_connections: 10,
@@ -317,7 +387,7 @@ mod tests {
             enable_browser: false,
             max_retries: 1,
             backoff_base_ms: 100,
-            searxng_url: None,
+            ..web_search_common::config::Config::default().crawler
         }
     }
 

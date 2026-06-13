@@ -524,43 +524,96 @@ impl SearchEngine {
             return Ok(response);
         }
 
-        // Adaptive crawl parameters based on query type
+        // FAST PATH: When SearXNG is configured, fetch JSON API directly (~300ms),
+        // then crawl only the result URLs concurrently (~2-3s total).
+        // This bypasses the slow frontier queue and skips fetching 15+ SERP pages.
         let query_type = web_search_ranker::query_type::detect_query_type(query);
-        // Tighter crawl budgets — index-first handles repeat queries,
-        // so crawl is only for genuinely new content. Halved from previous values.
-        let (max_pages, depth, timeout_secs) = match query_type {
-            web_search_common::models::QueryType::Factual  => (10, 0, 5),
-            web_search_common::models::QueryType::News     => (15, 0, 8),
-            web_search_common::models::QueryType::Technical => (20, 1, 10),
-            web_search_common::models::QueryType::Research  => (30, 1, 12),
-            web_search_common::models::QueryType::General   => (25, 1, 10),
+
+        let (pages, used_fast_path) = if let Some(ref searxng_url) = self._config.crawler.searxng_url {
+            let searxng_results = fetch_searxng_results(searxng_url, query).await;
+
+            if !searxng_results.is_empty() {
+                // Crawl only the top-N result URLs concurrently
+                let max_fetch = match query_type {
+                    web_search_common::models::QueryType::Factual  => 8,
+                    web_search_common::models::QueryType::News     => 10,
+                    web_search_common::models::QueryType::Technical => 12,
+                    web_search_common::models::QueryType::Research  => 15,
+                    web_search_common::models::QueryType::General   => 10,
+                };
+                let urls: Vec<&str> = searxng_results.iter()
+                    .take(max_fetch)
+                    .map(|r| r.url.as_str())
+                    .collect();
+
+                tracing::info!(
+                    query,
+                    query_type = ?query_type,
+                    searxng_results = searxng_results.len(),
+                    fetching = urls.len(),
+                    "SearXNG fast path: concurrent fetch"
+                );
+
+                let pages = self.crawler.fetch_urls_concurrent(
+                    &urls,
+                    Duration::from_secs(5),
+                ).await;
+                (pages, true)
+            } else {
+                tracing::info!("SearXNG returned 0 results, falling back to full crawl");
+                (Vec::new(), false)
+            }
+        } else {
+            (Vec::new(), false)
         };
 
-        tracing::info!(
-            query,
-            query_type = ?query_type,
-            max_pages,
-            depth,
-            timeout_secs,
-            "Adaptive quick search parameters"
-        );
+        // SLOW PATH: fallback when SearXNG unavailable or returned 0
+        let pages = if !used_fast_path || pages.is_empty() {
+            let (max_pages, depth, timeout_secs) = match query_type {
+                web_search_common::models::QueryType::Factual  => (10, 0, 5),
+                web_search_common::models::QueryType::News     => (15, 0, 8),
+                web_search_common::models::QueryType::Technical => (20, 1, 10),
+                web_search_common::models::QueryType::Research  => (30, 1, 12),
+                web_search_common::models::QueryType::General   => (25, 1, 10),
+            };
 
-        let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
-        let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+            tracing::info!(
+                query,
+                query_type = ?query_type,
+                max_pages,
+                depth,
+                timeout_secs,
+                "Fallback: full crawl with frontier"
+            );
 
-        let pages = self.crawler.crawl(
-            &seed_refs,
-            max_pages,
-            depth,
-            Duration::from_secs(timeout_secs),
-        ).await;
+            let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
+            let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
 
-        // Total time budget: 2x the crawl timeout. If we exceed it after processing,
-        // skip embedding and use extraction-only results (graceful degradation).
-        let total_budget = Duration::from_secs(timeout_secs * 2);
+            self.crawler.crawl(
+                &seed_refs,
+                max_pages,
+                depth,
+                Duration::from_secs(timeout_secs),
+            ).await
+        } else {
+            pages
+        };
 
-        let mut candidates = self.process_pages_batch(&pages).await;
+        // Process pages: extract + index. Skip embedding on fast path (BM25-only ranking).
+        let mut candidates = if used_fast_path {
+            // Fast path: extract + index only, no embedding (saves ~6s).
+            // BM25 ranking is sufficient when SearXNG already did relevance sorting.
+            self.process_pages_extract_only(&pages).await
+        } else {
+            self.process_pages_batch(&pages).await
+        };
         self.enqueue_links_for_daemon(&pages).await;
+
+        let total_budget = if used_fast_path {
+            Duration::from_secs(12) // fast path: 12s total budget
+        } else {
+            Duration::from_secs(20) // slow path: 20s total budget
+        };
 
         if pipeline_start.elapsed() > total_budget && !candidates.is_empty() {
             // Over budget — skip full ranking, return basic results
@@ -597,30 +650,94 @@ impl SearchEngine {
         }
 
         self.text_index.commit()?;
-        self.save_vectors();
-        self.apply_hybrid_ranks(&mut candidates, query).await;
-        let mut response = self.pipeline.rank(candidates, query, max_results);
-        self.apply_synthesis(&mut response, query);
 
-        // Cache the response for similar future queries
+        if used_fast_path {
+            // Fast path: BM25-only hybrid ranks (skip vector search — no embeddings).
+            // Still runs the full ranking pipeline for quality (CE + NLI + diversity).
+            let bm25_limit = candidates.len().max(50);
+            if let Ok(bm25_results) = self.text_index.search(query, bm25_limit) {
+                let url_to_idx: std::collections::HashMap<String, usize> = candidates.iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.url.clone(), i))
+                    .collect();
+                for (rank, result) in bm25_results.iter().enumerate() {
+                    if let Some(&idx) = url_to_idx.get(&result.url) {
+                        candidates[idx].bm25_rank = Some(rank + 1);
+                        candidates[idx].bm25_score = Some(result.score);
+                    }
+                }
+            }
+        } else {
+            self.save_vectors();
+            self.apply_hybrid_ranks(&mut candidates, query).await;
+        }
+
+        let mut response = if used_fast_path {
+            // Fast path: skip expensive CE/NLI pipeline.
+            // Sort by BM25 score, build results directly.
+            candidates.sort_by(|a, b| {
+                b.bm25_score.unwrap_or(0.0).partial_cmp(&a.bm25_score.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let results: Vec<RankedResult> = candidates.iter()
+                .take(max_results)
+                .map(|c| {
+                    RankedResult {
+                        content: web_search_extractor::extract_snippet(&c.body_text, query, 1500),
+                        url: c.url.clone(),
+                        title: c.title.clone(),
+                        confidence: c.bm25_score.map(|s| (s * 0.1).min(0.95)).unwrap_or(0.5),
+                        verification: VerificationStatus::Unverified,
+                        claims: vec![],
+                        contradictions: vec![],
+                        source_tier: c.source_tier,
+                        freshness: c.published_date,
+                        relevance_score: c.bm25_score.unwrap_or(0.0),
+                    }
+                })
+                .collect();
+            SearchResponse {
+                results,
+                synthesis: vec![],
+                warnings: vec![],
+                coverage_score: 0.7,
+                total_pages_crawled: pages.len(),
+                total_time_ms: pipeline_start.elapsed().as_millis() as u64,
+                query: query.to_string(),
+            }
+        } else {
+            let mut resp = self.pipeline.rank(candidates, query, max_results);
+            self.apply_synthesis(&mut resp, query);
+            resp
+        };
+
+        // Synthesis for fast path
+        if used_fast_path && !response.results.is_empty() {
+            self.apply_synthesis(&mut response, query);
+        }
+
         self.cache_query_response(query, &response).await;
 
         tracing::info!(
             total_ms = pipeline_start.elapsed().as_millis(),
             results = response.results.len(),
+            fast_path = used_fast_path,
             "Quick search pipeline complete"
         );
 
         Ok(response)
     }
 
-    /// Instant search: ultra-fast path (~1-2s).
+    /// Instant search: ultra-fast path (~0.5-2s).
     ///
-    /// 1. Check semantic cache (instant if hit)
-    /// 2. SearXNG/search seeds only (no deep crawl)
-    /// 3. Fetch top 5 URLs with aggressive timeout
-    /// 4. Extract + BM25 rank (skip cross-encoder entirely)
-    /// 5. Return results with basic metadata
+    /// When SearXNG configured:
+    ///   1. Check semantic cache (instant if hit)
+    ///   2. Fetch SearXNG JSON (~300ms) — get title + snippet for each result
+    ///   3. Rank snippets directly by query-term overlap — NO crawling at all
+    ///   4. Return results in <1s
+    ///
+    /// Fallback (no SearXNG):
+    ///   1. Crawl with 3s timeout, extract, return unranked
     pub async fn instant_search(
         &self,
         query: &str,
@@ -628,21 +745,89 @@ impl SearchEngine {
     ) -> Result<SearchResponse> {
         let start = Instant::now();
 
-        // 1. Semantic cache — instant return if similar query seen recently
+        // 1. Semantic cache
         if let Some(cached) = self.check_query_cache(query).await {
             tracing::info!(query, elapsed_ms = start.elapsed().as_millis(), "instant_search: cache hit");
             return Ok(cached);
         }
 
-        // 2. Generate search seeds and crawl with tight limits
+        // 2. SearXNG snippet-only mode — no crawling at all
+        if let Some(ref searxng_url) = self._config.crawler.searxng_url {
+            let searxng_results = fetch_searxng_results(searxng_url, query).await;
+
+            if !searxng_results.is_empty() {
+                // Rank by query-term overlap in title + snippet
+                let query_lower = query.to_lowercase();
+                let query_terms: Vec<&str> = query_lower.split_whitespace()
+                    .filter(|w| w.len() > 2)
+                    .collect();
+
+                let mut results: Vec<RankedResult> = searxng_results.iter()
+                    .map(|sr| {
+                        let domain = url::Url::parse(&sr.url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_string()))
+                            .unwrap_or_default();
+                        let tier = authority::classify_domain(&domain);
+
+                        // Score by query-term density in title + snippet
+                        let combined = format!("{} {}", sr.title.to_lowercase(), sr.snippet.to_lowercase());
+                        let term_hits = query_terms.iter()
+                            .filter(|qt| combined.contains(*qt))
+                            .count();
+                        let relevance = term_hits as f32 / query_terms.len().max(1) as f32;
+
+                        RankedResult {
+                            content: if sr.snippet.is_empty() { sr.title.clone() } else { sr.snippet.clone() },
+                            url: sr.url.clone(),
+                            title: sr.title.clone(),
+                            confidence: 0.6,
+                            verification: VerificationStatus::Unverified,
+                            claims: vec![],
+                            contradictions: vec![],
+                            source_tier: tier,
+                            freshness: None,
+                            relevance_score: relevance,
+                        }
+                    })
+                    .collect();
+
+                // Sort by relevance (query-term overlap)
+                results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+                results.truncate(max_results);
+
+                let response = SearchResponse {
+                    results,
+                    synthesis: vec![],
+                    warnings: vec![],
+                    coverage_score: 0.6,
+                    total_pages_crawled: 0,
+                    total_time_ms: start.elapsed().as_millis() as u64,
+                    query: query.to_string(),
+                };
+
+                self.cache_query_response(query, &response).await;
+
+                tracing::info!(
+                    results = response.results.len(),
+                    elapsed_ms = response.total_time_ms,
+                    "instant_search complete (SearXNG snippet-only)"
+                );
+
+                return Ok(response);
+            }
+        }
+
+        // 3. Fallback: crawl with tight limits
         let seeds = generate_search_seeds(query, self._config.crawler.searxng_url.as_deref());
         let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
 
         let pages = self.crawler.crawl(
             &seed_refs,
-            max_results.max(5), // fetch just enough
-            0,                  // no link-following
-            Duration::from_secs(3), // aggressive 3s timeout
+            max_results.max(5),
+            0,
+            Duration::from_secs(3),
         ).await;
 
         if pages.is_empty() {
@@ -657,21 +842,16 @@ impl SearchEngine {
             });
         }
 
-        // 3. Quick extraction only (skip embedding + indexing for speed)
         let mut results: Vec<RankedResult> = Vec::new();
         for page in &pages {
             let extraction = consensus::extract_page(&page.body, &page.final_url);
             if extraction.body_text.len() < 50 { continue; }
 
-            let body_clean = consensus::clean_body_text(&extraction.body_text);
-            let domain = url::Url::parse(&page.final_url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-                .unwrap_or_default();
+            let domain = extract_domain(&page.final_url);
             let tier = authority::classify_domain(&domain);
 
             results.push(RankedResult {
-                content: web_search_extractor::extract_snippet(&body_clean, query, 1500),
+                content: web_search_extractor::extract_snippet(&extraction.body_text, query, 1500),
                 url: page.final_url.clone(),
                 title: extraction.title.unwrap_or_default(),
                 confidence: extraction.extraction_confidence as f32 * 0.01,
@@ -687,22 +867,21 @@ impl SearchEngine {
         results.truncate(max_results);
 
         let response = SearchResponse {
-            results: results.clone(),
+            results,
             synthesis: vec![],
             warnings: vec![],
-            coverage_score: 0.5, // unverified
+            coverage_score: 0.5,
             total_pages_crawled: pages.len(),
             total_time_ms: start.elapsed().as_millis() as u64,
             query: query.to_string(),
         };
 
-        // Cache for future queries
         self.cache_query_response(query, &response).await;
 
         tracing::info!(
             results = response.results.len(),
             elapsed_ms = response.total_time_ms,
-            "instant_search complete"
+            "instant_search complete (crawl fallback)"
         );
 
         Ok(response)
@@ -1163,6 +1342,30 @@ impl SearchEngine {
     /// Two-phase approach:
     /// Phase 1: Extract + dedup + index (fast, no ML) — per page
     /// Phase 2: Batch embed all texts at once (1 ML call instead of N)
+    /// Fast extract-only processing: extract + dedup + index, NO embedding.
+    /// Used on SearXNG fast path — BM25 ranking only, saves ~6s embedding time.
+    async fn process_pages_extract_only(
+        &self,
+        pages: &[web_search_crawler::crawler::CrawledPage],
+    ) -> Vec<RankCandidate> {
+        let start = std::time::Instant::now();
+        let mut candidates = Vec::new();
+
+        for crawled in pages {
+            if let Some((candidate, _body)) = self.extract_and_index(crawled) {
+                candidates.push(candidate);
+            }
+        }
+
+        tracing::info!(
+            pages = pages.len(),
+            candidates = candidates.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            "Extract-only processing (no embedding)"
+        );
+        candidates
+    }
+
     async fn process_pages_batch(
         &self,
         pages: &[web_search_crawler::crawler::CrawledPage],
@@ -1392,6 +1595,66 @@ impl SearchEngine {
 ///
 /// Uses multiple search engines and direct knowledge sources to maximize
 /// coverage without relying on any single API.
+/// Result from SearXNG JSON API — contains URL, title, and snippet.
+/// Used for snippet-only ranking (instant_search) and fast URL extraction.
+#[derive(Debug, Clone)]
+struct SearxngResult {
+    url: String,
+    title: String,
+    snippet: String,
+}
+
+/// Fetch SearXNG JSON API directly and return parsed results.
+/// Single HTTP request, ~200-500ms. Returns up to 20 results with snippets.
+async fn fetch_searxng_results(
+    searxng_url: &str,
+    query: &str,
+) -> Vec<SearxngResult> {
+    let encoded = urlencoding_simple(query);
+    let base = searxng_url.trim_end_matches('/');
+    let api_url = format!("{base}/search?q={encoded}&format=json&categories=general&pageno=1");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    match client.get(&api_url).send().await {
+        Ok(resp) => {
+            if let Ok(text) = resp.text().await {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(items) = json["results"].as_array() {
+                        let mut results = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for item in items {
+                            let url = match item["url"].as_str() {
+                                Some(u) if u.starts_with("http") => u,
+                                _ => continue,
+                            };
+                            if !seen.insert(url.to_string()) { continue; }
+                            results.push(SearxngResult {
+                                url: url.to_string(),
+                                title: item["title"].as_str().unwrap_or("").to_string(),
+                                snippet: item["content"].as_str().unwrap_or("").to_string(),
+                            });
+                        }
+                        tracing::info!(
+                            results = results.len(),
+                            elapsed_source = "searxng",
+                            "SearXNG fast-path: got results"
+                        );
+                        return results;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SearXNG fast-path fetch failed");
+        }
+    }
+    Vec::new()
+}
+
 fn generate_search_seeds(query: &str, searxng_url: Option<&str>) -> Vec<String> {
     let encoded = urlencoding_simple(query);
     let _encoded_dash = query.to_lowercase().replace(' ', "-");

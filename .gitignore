@@ -1,4 +1,6 @@
 /target
+# Ignore Cargo build artifacts in any nested crate/spike (e.g. spike-wreq/target).
+**/target/
 /data
 /models/*.onnx
 *.swp

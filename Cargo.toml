@@ -8,6 +8,7 @@ members = [
     "crates/ranker",
     "crates/orchestrator",
     "crates/mcp-server",
+    "crates/benchmark",
 ]
 resolver = "2"
 
@@ -77,3 +78,12 @@ web-search-crawler = { path = "crates/crawler" }
 web-search-extractor = { path = "crates/extractor" }
 web-search-ranker = { path = "crates/ranker" }
 web-search-orchestrator = { path = "crates/orchestrator" }
+
+# R4 v2 (Design 0004 §0, ADR 0003 §7 Option R4-a): vendored + patched
+# chromiumoxide 0.7.0 that REMOVES the auto-fired `Runtime.enable` CDP command
+# at target init — the load-time signal Cloudflare/DataDome fingerprint. The
+# `crates/crawler` dep stays `version = "0.7"`; this patch redirects it to the
+# local fork. Sub-crates (`chromiumoxide_cdp`/`chromiumoxide_types` 0.7) are
+# left as published deps. See vendor/chromiumoxide/PATCH_NOTES.md.
+[patch.crates-io]
+chromiumoxide = { path = "vendor/chromiumoxide" }

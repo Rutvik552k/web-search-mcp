@@ -1,0 +1,5 @@
+# SAMPLE — format reference only. The operator's real file is benchmark/queries.jsonl
+# (same format, no comment lines needed). Blank lines and lines starting with
+# '#' or '//' are ignored by the harness.
+{"query": "rust async runtime", "relevant_urls": ["https://tokio.rs/", "https://docs.rs/tokio"], "notes": "tokio is the canonical async runtime"}
+{"query": "python web framework", "relevant_urls": ["https://flask.palletsprojects.com/", "https://www.djangoproject.com/"]}

@@ -1,4 +1,9 @@
+pub mod archive;
 pub mod browser;
+pub mod captcha;
+pub mod classifier;
+pub mod feeds;
+pub mod governor;
 pub mod fetcher;
 pub mod frontier;
 pub mod link_extractor;

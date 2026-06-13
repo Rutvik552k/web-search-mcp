@@ -1,11 +1,12 @@
 pub mod chunker;
+pub mod hydration;
 pub mod metadata;
 pub mod readability;
 pub mod snippet;
 pub mod trafilatura;
 pub mod consensus;
 
-pub use consensus::{extract_page, clean_body_text, is_serp_page};
+pub use consensus::{extract_page, extract_page_with_config, clean_body_text, is_serp_page};
 pub use snippet::extract_snippet;
 
 use chrono::{DateTime, Utc};

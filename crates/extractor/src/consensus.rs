@@ -1,8 +1,11 @@
 use web_search_common::models::Page;
 use web_search_common::models::PageMetadata;
+use web_search_common::config::ExtractorConfig;
 use chrono::Utc;
 use regex::Regex;
+use serde_json::Value;
 
+use crate::hydration;
 use crate::metadata;
 use crate::readability;
 use crate::trafilatura;
@@ -80,7 +83,44 @@ fn clean_css_artifacts(text: &str) -> String {
 /// Pass 2: Readability (DOM scoring, F1~0.80)
 ///
 /// Post-step: Clean body text (remove residual CSS, collapse whitespace)
+///
+/// Default entry point — data-layer acquisition is OFF, so output is identical to
+/// the pre-data-layer pipeline. To enable in-band hydration salvage / structured
+/// promotion (ADR 0002), call [`extract_page_with_config`] with a config that has
+/// `enable_data_layer = true`.
 pub fn extract_page(html: &str, url: &str) -> ExtractionResult {
+    extract_base(html, url)
+}
+
+/// Config-aware extraction. Runs the standard consensus pipeline, then — only when
+/// `cfg.enable_data_layer` is set — applies the two in-band, near-free data-layer
+/// techniques from ADR 0002:
+///   1.5.2 structured-data promotion (JSON-LD `articleBody` / OG → primary content)
+///   1.5.1 hydration-state salvage (`__NEXT_DATA__`/`__NUXT__`/state/RSC blobs)
+///
+/// Both are additive: metadata fields are only *filled when missing*, and the body
+/// is only *replaced when the data-layer text is richer* than the consensus body.
+/// With `enable_data_layer = false` this is byte-for-byte equal to [`extract_page`].
+pub fn extract_page_with_config(html: &str, url: &str, cfg: &ExtractorConfig) -> ExtractionResult {
+    let mut result = extract_base(html, url);
+
+    if !cfg.enable_data_layer {
+        return result;
+    }
+
+    if cfg.data_layer_structured_promotion {
+        promote_structured(&mut result);
+    }
+    if cfg.data_layer_hydration {
+        salvage_from_hydration(html, &mut result);
+    }
+
+    result
+}
+
+/// The original consensus extraction. Kept separate so [`extract_page`] stays
+/// byte-for-byte identical regardless of data-layer changes.
+fn extract_base(html: &str, url: &str) -> ExtractionResult {
     // Sanitize HTML before extraction
     let clean_html = sanitize_html(html);
 
@@ -133,6 +173,170 @@ pub fn extract_page(html: &str, url: &str) -> ExtractionResult {
         open_graph: meta.open_graph,
         extraction_confidence: final_confidence,
     }
+}
+
+// ── Data-Layer Acquisition (ADR 0002, Rung -1 IN-band) ───────────────────────
+
+/// Body length (chars) at/below which the consensus extraction is considered
+/// "thin" — i.e. likely soft-blocked or a JS shell, a candidate for salvage.
+const THIN_BODY_CHARS: usize = 200;
+/// Confidence floor below which we treat the extraction as low-quality.
+const LOW_CONFIDENCE: f32 = 0.6;
+
+/// True when `candidate` is substantive enough to replace `current` as body text.
+/// Requires the candidate to be meaningful on its own AND either the current body
+/// is near-empty or the candidate is meaningfully (>20%) longer.
+fn is_richer(candidate: &str, current: &str) -> bool {
+    let c = candidate.trim().chars().count();
+    if c < THIN_BODY_CHARS {
+        return false;
+    }
+    let cur = current.trim().chars().count();
+    cur < 50 || (c as f32) > (cur as f32) * 1.2
+}
+
+/// 1.5.2 — Promote already-parsed structured data (JSON-LD Article / OpenGraph)
+/// to primary content when richer than the consensus body. Fills missing metadata
+/// unconditionally; replaces the body only when `is_richer`.
+fn promote_structured(result: &mut ExtractionResult) {
+    if let Some(article) = result.json_ld.as_ref().and_then(json_ld_article) {
+        if result.title.is_none() {
+            result.title = article.headline.clone();
+        }
+        if result.description.is_none() {
+            result.description = article.description.clone();
+        }
+        if result.author.is_none() {
+            result.author = article.author.clone();
+        }
+        if result.published_date.is_none() {
+            if let Some(d) = article.date.as_deref().and_then(metadata::parse_date) {
+                result.published_date = Some(d);
+            }
+        }
+        if let Some(body) = article.article_body.as_deref() {
+            if is_richer(body, &result.body_text) {
+                result.body_text = clean_body_text(body);
+                result.extraction_confidence = result.extraction_confidence.max(0.75);
+            }
+        }
+    }
+
+    // OG carries title/description only (never a full body) — fill if still missing.
+    if let Some(og) = result.open_graph.as_ref() {
+        if result.title.is_none() {
+            result.title = og.og_title.clone();
+        }
+        if result.description.is_none() {
+            result.description = og.og_description.clone();
+        }
+    }
+}
+
+/// 1.5.1 — Salvage content from an embedded hydration blob when the consensus
+/// extraction is thin (soft-block / JS shell). Fills missing metadata and replaces
+/// the body only when the hydration text is richer.
+fn salvage_from_hydration(html: &str, result: &mut ExtractionResult) {
+    let still_thin = result.extraction_confidence < LOW_CONFIDENCE
+        || result.body_text.trim().chars().count() < THIN_BODY_CHARS;
+    if !still_thin {
+        return;
+    }
+
+    let Some(h) = hydration::extract(html) else {
+        return;
+    };
+
+    if result.title.is_none() {
+        result.title = h.title;
+    }
+    if result.description.is_none() {
+        result.description = h.description;
+    }
+    if result.author.is_none() {
+        result.author = h.author;
+    }
+    if result.published_date.is_none() {
+        if let Some(d) = h.published.as_deref().and_then(metadata::parse_date) {
+            result.published_date = Some(d);
+        }
+    }
+    if is_richer(&h.body_text, &result.body_text) {
+        tracing::debug!(source = h.source, "data-layer: salvaged body from hydration blob");
+        result.body_text = clean_body_text(&h.body_text);
+        result.extraction_confidence = result.extraction_confidence.max(0.6);
+    }
+}
+
+/// Structured article fields harvested from a JSON-LD blob.
+struct StructuredArticle {
+    headline: Option<String>,
+    description: Option<String>,
+    author: Option<String>,
+    date: Option<String>,
+    article_body: Option<String>,
+}
+
+/// Locate an Article-like node in a JSON-LD value (handles a bare node, a top-level
+/// array of nodes, and `@graph` arrays) and pull out its content fields.
+fn json_ld_article(value: &Value) -> Option<StructuredArticle> {
+    fn is_article_type(node: &Value) -> bool {
+        let t = &node["@type"];
+        let matches = |s: &str| {
+            let s = s.to_ascii_lowercase();
+            s.contains("article") || s == "blogposting" || s == "report"
+        };
+        match t {
+            Value::String(s) => matches(s),
+            Value::Array(arr) => arr.iter().any(|v| v.as_str().map(matches).unwrap_or(false)),
+            _ => false,
+        }
+    }
+
+    fn from_node(node: &Value) -> Option<StructuredArticle> {
+        if !is_article_type(node) {
+            return None;
+        }
+        let get = |k: &str| node[k].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let author = match &node["author"] {
+            Value::String(s) => Some(s.trim().to_string()),
+            Value::Object(_) => node["author"]["name"].as_str().map(|s| s.trim().to_string()),
+            Value::Array(arr) => arr
+                .first()
+                .and_then(|a| a.get("name").and_then(|n| n.as_str()).or_else(|| a.as_str()))
+                .map(|s| s.trim().to_string()),
+            _ => None,
+        }
+        .filter(|s| !s.is_empty());
+
+        Some(StructuredArticle {
+            headline: get("headline").or_else(|| get("name")),
+            description: get("description"),
+            author,
+            date: get("datePublished").or_else(|| get("dateCreated")),
+            article_body: get("articleBody"),
+        })
+    }
+
+    // Candidate node lists: the value itself, its array elements, or its @graph.
+    if let Some(a) = from_node(value) {
+        return Some(a);
+    }
+    if let Value::Array(arr) = value {
+        for node in arr {
+            if let Some(a) = from_node(node) {
+                return Some(a);
+            }
+        }
+    }
+    if let Value::Array(graph) = &value["@graph"] {
+        for node in graph {
+            if let Some(a) = from_node(node) {
+                return Some(a);
+            }
+        }
+    }
+    None
 }
 
 /// Convert extraction result + crawl metadata into a Page model.
@@ -604,5 +808,107 @@ mod tests {
         let result = extract_page(html, "https://example.com/");
         assert!(!result.body_text.contains("svg"));
         assert!(!result.body_text.contains("path"));
+    }
+
+    // ── Data-Layer Acquisition tests (ADR 0002) ──────────────────────────────
+
+    fn data_layer_on() -> ExtractorConfig {
+        let mut c = web_search_common::config::Config::default().extractor;
+        c.enable_data_layer = true;
+        c
+    }
+
+    /// A page whose rendered DOM is a thin JS shell (no real paragraphs).
+    const THIN_SHELL: &str = r#"<html><head><title>Loading…</title></head>
+        <body><div id="root">Please enable JavaScript to view this site.</div></body></html>"#;
+
+    #[test]
+    fn structured_promotion_lifts_jsonld_article_body() {
+        // Thin DOM, but a JSON-LD Article carries the full body (1.5.2).
+        let html = r#"<html><head><title>News</title>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"NewsArticle",
+         "headline":"Reactor sets fusion record",
+         "description":"A tokamak sustained plasma for a record duration.",
+         "author":{"name":"Pat Rivera"},
+         "datePublished":"2026-04-02T12:00:00Z",
+         "articleBody":"The experimental tokamak sustained a burning plasma for a record one hundred seconds during a run this week, more than doubling the previous mark. Engineers credited improved magnetic confinement and a redesigned divertor for handling the intense heat flux at the reactor wall."}
+        </script></head>
+        <body><div id="app"></div></body></html>"#;
+
+        // Off → byte-for-byte base: body stays thin, no promotion.
+        let off = extract_page(html, "https://news.example/r");
+        assert!(off.body_text.chars().count() < THIN_BODY_CHARS);
+
+        // On → body promoted from JSON-LD; missing metadata filled (title already
+        // present from <title>, so it is preserved — promotion is additive).
+        let on = extract_page_with_config(html, "https://news.example/r", &data_layer_on());
+        assert!(on.body_text.contains("burning plasma"));
+        assert_eq!(on.author.as_deref(), Some("Pat Rivera"));
+        assert_eq!(on.description.as_deref(), Some("A tokamak sustained plasma for a record duration."));
+        assert!(on.published_date.is_some());
+        assert!(on.extraction_confidence >= 0.75);
+    }
+
+    #[test]
+    fn hydration_salvage_recovers_next_data_body() {
+        // Thin DOM, but __NEXT_DATA__ carries the article (1.5.1 salvage).
+        let html = r#"<html><head><title>Soft block</title>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"article":{
+            "headline":"Trade talks resume",
+            "articleBody":"Negotiators returned to the table on Monday after a two-week pause, signaling renewed willingness to compromise on tariffs. Officials from both delegations described the opening session as constructive and said working groups would meet through the week to draft a framework agreement covering agriculture and technology.",
+            "datePublished":"2026-03-10T09:30:00Z"
+        }}},"buildId":"z9"}
+        </script></head>
+        <body><div id="__next">Loading…</div></body></html>"#;
+
+        let off = extract_page(html, "https://soft.example/a");
+        assert!(off.body_text.chars().count() < THIN_BODY_CHARS);
+
+        let on = extract_page_with_config(html, "https://soft.example/a", &data_layer_on());
+        assert!(on.body_text.contains("Negotiators returned to the table"));
+        assert!(on.published_date.is_some());
+    }
+
+    #[test]
+    fn rich_consensus_body_is_not_overridden() {
+        // A normal article with a real DOM body must NOT be replaced by a shorter
+        // JSON-LD/hydration field — promotion only fires when data-layer is richer.
+        let html = r#"<html><head><title>Real Article - Site</title>
+        <script type="application/ld+json">{"@type":"Article","headline":"Real Article","description":"short"}</script>
+        </head><body><article class="post-content">
+            <h1>Real Article</h1>
+            <p>This is a fully server-rendered article with substantial paragraph content that the consensus extractors identify confidently as the main body of the page without any help.</p>
+            <p>A second paragraph adds more depth and detail, ensuring the consensus body is long and high-confidence so the data-layer pass has no reason to override it at all.</p>
+            <p>A third paragraph rounds things out with a concluding thought and a few more sentences of genuine article prose for good measure here.</p>
+        </article></body></html>"#;
+
+        let base = extract_page(html, "https://real.example/x");
+        let on = extract_page_with_config(html, "https://real.example/x", &data_layer_on());
+        assert_eq!(base.body_text, on.body_text, "rich body must be preserved");
+    }
+
+    #[test]
+    fn no_blob_data_layer_is_noop() {
+        // Data-layer ON but no structured data and no hydration blob → identical
+        // to base extraction (negative case).
+        let base = extract_page(THIN_SHELL, "https://plain.example/");
+        let on = extract_page_with_config(THIN_SHELL, "https://plain.example/", &data_layer_on());
+        assert_eq!(base.body_text, on.body_text);
+        assert_eq!(base.title, on.title);
+    }
+
+    #[test]
+    fn data_layer_off_equals_base() {
+        // Even with a salvageable blob present, OFF must equal extract_page exactly.
+        let html = r#"<html><head><script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"article":{"articleBody":"Some recoverable body text that is long enough to be considered a meaningful salvage candidate for the data layer path when it is enabled by config."}}}}
+        </script></head><body><div id="__next"></div></body></html>"#;
+
+        let cfg_off = web_search_common::config::Config::default().extractor; // enable_data_layer = false
+        let base = extract_page(html, "https://x.example/");
+        let off = extract_page_with_config(html, "https://x.example/", &cfg_off);
+        assert_eq!(base.body_text, off.body_text);
     }
 }

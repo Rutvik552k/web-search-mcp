@@ -1,0 +1,22 @@
+# ============================================================================
+# THROWAWAY VERIFICATION SPIKE — TASKS.md task 2.0 (wreq build de-risk).
+# NOT a workspace member. The empty [workspace] table below makes this its own
+# isolated workspace root so it does NOT touch the repo's root Cargo.toml or any
+# shipping crate's dependencies. DELETE after the spike decision is recorded.
+# ============================================================================
+[workspace]
+
+[package]
+name = "wreq-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Pinned exactly. Pairing determined empirically from the crates.io index:
+#   wreq 5.3.0 -> boring2 ^4.15.11 (BoringSSL via boring-sys2)
+#   wreq-util 2.2.6 requires wreq ">=3.0.5, <6"  (COMPATIBLE with 5.3.0)
+#   wreq-util 3.0.0-rc.12 requires wreq "^6.0.0-rc" (NOT compatible — would force wreq 6 rc)
+wreq = { version = "=5.3.0", features = ["cookies", "gzip", "brotli"] }
+wreq-util = "=2.2.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

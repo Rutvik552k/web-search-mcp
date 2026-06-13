@@ -95,7 +95,9 @@ fn extract_date(doc: &Html) -> Option<DateTime<Utc>> {
     None
 }
 
-fn parse_date(s: &str) -> Option<DateTime<Utc>> {
+/// Parse a date string (RFC 3339 or a few common formats) into UTC.
+/// Public so the data-layer path can reuse it for hydration/JSON-LD date strings.
+pub fn parse_date(s: &str) -> Option<DateTime<Utc>> {
     // Try ISO 8601
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));

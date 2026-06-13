@@ -1,0 +1,35 @@
+[package]
+name = "web-search-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Main harness: connects to an MCP server, runs the G1/G2/G3 benchmark.
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+# Hermetic mock MCP server — used ONLY for the harness self-test (no network,
+# no ML models). Lets `cargo test` / the smoke run exercise the full JSON-RPC
+# round-trip deterministically. The real baseline points --server at
+# `web-search-mcp` instead.
+[[bin]]
+name = "mock-mcp-server"
+path = "src/bin/mock_mcp_server.rs"
+
+[dependencies]
+# rmcp: client side + child-process transport for spawning the server over stdio.
+# Server side + transport-io are needed by the mock-mcp-server bin.
+rmcp = { workspace = true, features = [
+    "client",
+    "server",
+    "transport-child-process",
+    "transport-io",
+] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

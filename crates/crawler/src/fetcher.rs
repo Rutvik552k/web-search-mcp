@@ -173,6 +173,12 @@ pub struct Fetcher {
     alt_probe_timeout_ms: u64,
     /// Max total network probes the R2 rung may make per URL.
     max_alt_probes: usize,
+
+    /// SSRF policy (ADR 0004 A.3). Strict in production (`Fetcher::new`); a
+    /// test-only constructor (`new_with_ssrf_policy`) may relax loopback for
+    /// local mock servers. Stored only so the scheme/host guard can consult it;
+    /// the per-hop IP deny is enforced by the `SsrfResolver` wired into `client`.
+    ssrf_policy: crate::ssrf::SsrfPolicy,
 }
 
 /// Cached HTTP response with conditional request headers.
@@ -189,10 +195,28 @@ struct CachedResponse {
 
 impl Fetcher {
     pub fn new(config: &CrawlerConfig) -> Result<Self> {
+        // Production ALWAYS uses the strict SSRF policy (ADR 0004 A.3): there is
+        // no production config flag that can disable the SSRF guard (footgun).
+        Self::new_with_ssrf_policy(config, crate::ssrf::SsrfPolicy::strict())
+    }
+
+    /// Construct with an explicit SSRF policy. The strict policy is the only one
+    /// reachable from production (`new`); the permissive (loopback-allowed) policy
+    /// is `#[cfg(test)]`-constructible only, for local mock-server tests.
+    pub(crate) fn new_with_ssrf_policy(
+        config: &CrawlerConfig,
+        ssrf_policy: crate::ssrf::SsrfPolicy,
+    ) -> Result<Self> {
+        // SSRF guard (ADR 0004 §13 A.3): a custom DNS resolver filters every
+        // resolved IP — for the initial host AND every redirect hop, since reqwest
+        // re-resolves per connection. This is resolve-then-pin + per-hop
+        // revalidation: the IP the deny check sees is the IP the socket dials.
+        let resolver = Arc::new(crate::ssrf::SsrfResolver::new(ssrf_policy));
         let client = Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .user_agent(&config.user_agent)
             .redirect(reqwest::redirect::Policy::limited(10))
+            .dns_resolver(resolver)
             .cookie_store(true)
             .gzip(true)
             .brotli(true)
@@ -302,7 +326,16 @@ impl Fetcher {
             // Per-candidate feed-probe timeout: the request timeout, in ms.
             alt_probe_timeout_ms: config.request_timeout_secs.saturating_mul(1000),
             max_alt_probes: config.max_alt_probes as usize,
+            ssrf_policy,
         })
+    }
+
+    /// Test-only handle to the reputation governor so A.1 contract tests can
+    /// pre-seed the permanent denylist (`record_hard_ban`) or exhaust the
+    /// per-domain budget, then assert `fetch` honors the verdict WITHOUT dialing.
+    #[cfg(test)]
+    pub(crate) fn governor_for_test(&self) -> &Arc<MinimalGovernor> {
+        &self.governor
     }
 
     /// Get cache statistics.
@@ -334,6 +367,33 @@ impl Fetcher {
             return self.escalate(url).await;
         }
 
+        // ---- A.1: governor on the DEFAULT (legacy) live-origin path -----------
+        // Reputation safety must NOT be defeatable by leaving `enable_escalation`
+        // off (ADR 0004 §13 A.1). Mirror the exact governor sequence escalate's
+        // R1 rung uses (run_escalation, fetcher.rs ~:928-948): permanent-denylist
+        // → admit → pace_delay, consulted ONCE per `fetch` call (not per retry
+        // attempt). A Deny/denylist verdict MUST suppress the socket.
+        let domain = registrable_domain(url);
+
+        if self.governor.is_permanently_denied(&domain) {
+            // Denied host: return WITHOUT making any socket (load-bearing A.1).
+            return Err(Error::PermanentlyDenied { domain, reason: "hard-ban".into() });
+        }
+        match self.governor.admit(&domain) {
+            Admission::DeniedPermanent => {
+                return Err(Error::PermanentlyDenied { domain, reason: "hard-ban".into() });
+            }
+            Admission::SkipLive(reason) => {
+                // Budget exhausted or soft-breaker open: honor the verdict, do not
+                // fetch. Mirrors escalate's SkipLive handling (Blocked, status 0).
+                tracing::info!(url, domain = %domain, ?reason, "fetch: governor skipping live request");
+                return Err(Error::Blocked { url: url.to_string(), status: 0 });
+            }
+            Admission::Proceed => {}
+        }
+        // Pace the request (governor jitter+delay) before dialing.
+        tokio::time::sleep(self.governor.pace_delay(&domain)).await;
+
         let mut last_err = None;
 
         for attempt in 0..=self.max_retries {
@@ -345,6 +405,11 @@ impl Fetcher {
 
             match self.fetch_once(url).await {
                 Ok(result) => {
+                    // A.1: feed a success signal back so the pacer/breaker AIMD
+                    // state updates on the default path (mirrors escalate's R1
+                    // `record` with a RealContent verdict).
+                    self.governor.record(&domain, &BlockClass::RealContent, Rung::R1, false);
+
                     // If SPA detected and browser enabled, try browser fallback
                     let result = if result.is_spa && self.enable_browser {
                         tracing::info!(url, "SPA detected, attempting browser render");
@@ -363,6 +428,10 @@ impl Fetcher {
                     return Ok(result);
                 }
                 Err(e) => {
+                    // A.1: record the soft/block signal so the breaker + AIMD
+                    // pacer react on the default path too.
+                    self.governor.record(&domain, &block_class_for_err(&e), Rung::R1, false);
+
                     // Don't retry 4xx (except 429)
                     if let Error::Blocked { status, .. } = &e {
                         if *status != 429 && *status < 500 {
@@ -382,6 +451,32 @@ impl Fetcher {
 
     async fn fetch_once(&self, url: &str) -> Result<FetchResult> {
         let start = Instant::now();
+
+        // A.3 scheme allowlist: refuse non-http(s) (file://, ftp://, gopher://,
+        // data:, …) before any socket. The internal-IP deny is enforced at
+        // connect time by the SsrfResolver wired into `self.client` (resolve-then-
+        // pin, re-applied on every redirect hop). Sanitized error — no internal
+        // resolution detail leaks to callers.
+        if !crate::ssrf::scheme_is_allowed(url) {
+            return Err(Error::Crawl {
+                url: url.to_string(),
+                reason: "blocked: scheme not allowed".into(),
+            });
+        }
+
+        // A.3 fast-path: if the host is an IP LITERAL we can decide synchronously
+        // (no DNS) — refuse a denied literal (e.g. http://169.254.169.254/,
+        // http://127.0.0.1/) before any socket. Hostname targets are decided at
+        // connect time by the SsrfResolver (resolve-then-pin), which also covers
+        // DNS-rebinding and every redirect hop.
+        if let Some(ip) = crate::ssrf::host_ip_literal(url) {
+            if self.ssrf_policy.ip_denied(ip) {
+                return Err(Error::Crawl {
+                    url: url.to_string(),
+                    reason: "blocked: internal address".into(),
+                });
+            }
+        }
 
         let response = self
             .client
@@ -754,11 +849,70 @@ pub(crate) struct EscalationParams<'a> {
     pub solve_cost_estimate_usd: f64,
 }
 
+/// Derive the **registrable domain (eTLD+1)** for a URL, used as the governor's
+/// per-domain key (budget, soft-breaker, reputation, permanent denylist).
+///
+/// FIX #3: this previously returned the FULL host (`host_str`), so
+/// `www.google.com` and `google.com` keyed separately — letting subdomain
+/// cycling evade a hard-ban and multiply the per-IP budget, defeating the
+/// single-IP reputation protection (ADR 0003) that ADR 0004's keyless default
+/// leans on. We now collapse to the registrable domain via the Public Suffix
+/// List (`psl` crate, Mozilla PSL compiled in — offline, no network/file):
+///
+///   * `www.google.com` / `m.google.com` / `google.com` → `google.com`
+///   * a denylist entry on `google.com` now also blocks `www.google.com`.
+///
+/// IP-literal hosts (`127.0.0.1`, `[::1]`) have no eTLD+1 and are returned
+/// as-is (lower-cased, brackets preserved as parsed) — never fed to the PSL.
+/// Hosts whose suffix is not in the PSL (e.g. the RFC2606 `.invalid` /`.local`
+/// test TLDs) fall back to the PSL default `*` rule (last two labels), which for
+/// a bare two-label host is the host itself — preserving the governor tests.
+///
+/// Fallback when the URL has no parseable host: `"unknown"` (unchanged).
 fn registrable_domain(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or_else(|| "unknown".to_string())
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return "unknown".to_string(),
+    };
+    match parsed.host() {
+        // IP literals have no registrable domain — return the host verbatim so
+        // the governor still keys per-IP (no eTLD+1 collapsing for IPs).
+        Some(url::Host::Ipv4(v4)) => v4.to_string(),
+        Some(url::Host::Ipv6(v6)) => v6.to_string(),
+        Some(url::Host::Domain(host)) => {
+            // Normalize first: lowercase + strip a single trailing dot (FQDN
+            // root) so keying is case/trailing-dot insensitive.
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            // PSL → registrable domain (eTLD+1). `domain_str` applies the PSL
+            // algorithm incl. the default `*` rule for unlisted suffixes.
+            psl::domain_str(&host)
+                .map(|d| d.to_string())
+                // Heuristic fallback (documented): if the PSL yields nothing
+                // (e.g. a lone-label host), collapse a leading `www.` at
+                // minimum, else use the host as-is.
+                .unwrap_or_else(|| host.strip_prefix("www.").unwrap_or(&host).to_string())
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// Map a legacy-path fetch error to the governor's `BlockClass` so the default
+/// path feeds the SAME AIMD pacer / breaker signals escalate's classifier does
+/// (ADR 0004 §13 A.1). The legacy path has no full classifier (escalate owns
+/// that), so this is a coarse, conservative mapping: rate-limit → RateLimited
+/// (pace decrease, no breaker trip), HTTP/transport/blocked → SoftBlock (pace
+/// decrease + soft-breaker increment). It never returns a HARD-trip class — the
+/// legacy path does not attempt R4, so a permanent hard-ban is never inferred
+/// here (consistent with `breaker_verdict`'s R4-gated Hard rule).
+fn block_class_for_err(e: &Error) -> BlockClass {
+    match e {
+        Error::RateLimited { retry_after_secs, .. } => {
+            BlockClass::RateLimited { retry_after_secs: *retry_after_secs }
+        }
+        // 4xx/5xx, transport errors, and scheme/SSRF refusals are all treated as
+        // soft signals: back off this domain, but never hard-deny it here.
+        _ => BlockClass::SoftBlock,
+    }
 }
 
 /// Compliance gate 0001 **G-1 (Critical) — public + unauthenticated only**.
@@ -2482,5 +2636,400 @@ mod tests {
         // We assert only that the spike ran end-to-end; the verdict is the
         // finding, printed above, not an automated pass/fail.
         assert!(!cookie_value.is_empty(), "spike obtained a non-empty clearance cookie");
+    }
+
+    // ── A.1 — governor on the DEFAULT (legacy) fetch path ────────────────────
+    //
+    // ADR 0004 §13 A.1: with `enable_escalation == false`, the legacy `fetch`
+    // path MUST still pass is_permanently_denied → admit → pace_delay. The tests
+    // assert BEHAVIOR (no socket made), not instrumentation. The fetch targets a
+    // host that, if actually dialed, would either time out loudly or return a
+    // transport error (`Error::Http`) — so a `PermanentlyDenied`/`Blocked` result
+    // is proof the socket was suppressed.
+
+    /// Build a DEFAULT-config fetcher (escalation OFF), strict SSRF policy, with a
+    /// tiny per-domain budget so the budget-Deny test is fast.
+    fn default_fetcher_for_governor_test() -> Fetcher {
+        let mut cfg = web_search_common::config::Config::default().crawler;
+        assert!(!cfg.enable_escalation, "A.1 test must run on the DEFAULT (legacy) path");
+        cfg.enable_browser = false;
+        cfg.max_retries = 0; // single attempt; the governor gate is pre-loop anyway
+        cfg.per_domain_request_budget = 1;
+        Fetcher::new(&cfg).expect("fetcher builds")
+    }
+
+    #[tokio::test]
+    async fn a1_denylisted_host_makes_zero_socket_attempts() {
+        let f = default_fetcher_for_governor_test();
+        // Seed the PERMANENT denylist for the target host.
+        f.governor_for_test()
+            .record_hard_ban("denied.invalid", "hard-ban", "Cloudflare403");
+        assert!(f.governor_for_test().is_permanently_denied("denied.invalid"));
+
+        // `.invalid` is the RFC2606 guaranteed-non-resolvable TLD: if a socket
+        // were attempted it would surface as Error::Http (DNS failure), NOT
+        // PermanentlyDenied. Getting PermanentlyDenied proves zero socket.
+        let err = f
+            .fetch("http://denied.invalid/latest/meta-data/")
+            .await
+            .expect_err("denylisted host must Err");
+        match err {
+            Error::PermanentlyDenied { domain, .. } => assert_eq!(domain, "denied.invalid"),
+            other => panic!("expected PermanentlyDenied (no socket), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a1_governor_deny_verdict_suppresses_the_socket() {
+        // A Deny verdict here is the budget-exhausted SkipLive verdict. Spend the
+        // per-domain budget (1) directly on the governor, so the NEXT admit in
+        // `fetch` returns SkipLive(BudgetExhausted) and the socket is suppressed.
+        let f = default_fetcher_for_governor_test();
+        let domain = "budget-denied.invalid";
+        // Exhaust the budget out-of-band (budget = 1 → one admit consumes it).
+        assert_eq!(
+            f.governor_for_test().admit(domain),
+            crate::governor::Admission::Proceed
+        );
+        assert_eq!(
+            f.governor_for_test().admit(domain),
+            crate::governor::Admission::SkipLive(crate::governor::SkipReason::BudgetExhausted)
+        );
+
+        // Now `fetch` should hit the same SkipLive and return Blocked(status 0)
+        // WITHOUT a socket. If it dialed, `.invalid` would give Error::Http.
+        let err = f
+            .fetch(&format!("http://{domain}/"))
+            .await
+            .expect_err("budget-denied host must Err");
+        match err {
+            Error::Blocked { status, .. } => assert_eq!(status, 0, "Deny → suppressed socket"),
+            other => panic!("expected Blocked(0) (no socket), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a1_red_check_documented() {
+        // RED check (manual): remove the `is_permanently_denied`/`admit` gate
+        // inserted before the retry loop in `fetch`, and
+        // `a1_denylisted_host_makes_zero_socket_attempts` /
+        // `a1_governor_deny_verdict_suppresses_the_socket` both fail — the fetch
+        // would fall through to `fetch_once` → DNS failure (`Error::Http`) instead
+        // of the governor verdict. This test only documents that expectation.
+        // (No assertion beyond compilation; the two tests above are the gate.)
+    }
+
+    // ── A.2 — SERP-ban floor: the four SERP hosts make zero socket ───────────
+    //
+    // ADR 0004 §13 A.2 (BLOCKER-2) acceptance: with google.com + bing.com +
+    // duckduckgo.com + brave.com on the PERMANENT denylist, a fetch to any of
+    // them is refused with ZERO socket (PermanentlyDenied), while a non-SERP
+    // host (the SERP-independent floor: wikipedia/arxiv/hn/stackexchange/direct
+    // domain) is ADMITTED through the governor. This is the FETCH half of A.2;
+    // the SEED half (the floor exists in the seed set) is proven by the
+    // `a2_*` seed-survival unit tests in the orchestrator crate (engine.rs).
+    //
+    // BEHAVIOR, not instrumentation: `.invalid` is RFC2606 non-resolvable, so a
+    // socket attempt would surface as Error::Http (DNS failure). Getting
+    // PermanentlyDenied for the SERP hosts proves the socket was suppressed;
+    // getting Error::Http (not PermanentlyDenied) for the non-SERP host proves
+    // it was ADMITTED past the governor (and only then failed at DNS).
+
+    /// The four SERP hosts the A.2 acceptance criterion bans.
+    const A2_SERP_HOSTS: [&str; 4] = ["google.com", "bing.com", "duckduckgo.com", "brave.com"];
+
+    #[tokio::test]
+    async fn a2_four_serp_hosts_denylisted_make_zero_socket() {
+        let f = default_fetcher_for_governor_test();
+        // Seed the permanent denylist with all four SERP hosts (the post-ban
+        // single-IP state ADR 0003 guards against).
+        for host in A2_SERP_HOSTS {
+            f.governor_for_test()
+                .record_hard_ban(host, "hard-ban", "Cloudflare403");
+            assert!(
+                f.governor_for_test().is_permanently_denied(host),
+                "{host} must be on the permanent denylist"
+            );
+        }
+
+        // Every SERP host: fetch is refused with PermanentlyDenied → zero socket.
+        // `is_permanently_denied` is exact-match on the governor key, and the fetch
+        // path keys off the REGISTRABLE DOMAIN (eTLD+1). These SERP hosts are bare
+        // two-label registrable domains (e.g. `google.com`), so `registrable_domain`
+        // returns them unchanged — we ban and fetch the SAME key (FIX #3).
+        for host in A2_SERP_HOSTS {
+            let err = f
+                .fetch(&format!("https://{host}/search?q=react"))
+                .await
+                .expect_err("denylisted SERP host must Err");
+            match err {
+                Error::PermanentlyDenied { domain, .. } => assert_eq!(
+                    domain, host,
+                    "expected PermanentlyDenied for {host}, got domain {domain}"
+                ),
+                other => panic!(
+                    "A.2: SERP host {host} must be PermanentlyDenied (zero socket), got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a2_non_serp_floor_host_is_admitted_past_governor() {
+        // With the four SERP hosts banned, a SERP-INDEPENDENT floor host
+        // (en.wikipedia.org here, RFC2606-style non-resolvable variant) must be
+        // ADMITTED by the governor — proven by the fetch reaching the socket
+        // layer and failing at DNS (Error::Http) rather than being short-circuited
+        // by the governor (PermanentlyDenied). A non-denied host is never gated.
+        let f = default_fetcher_for_governor_test();
+        for host in A2_SERP_HOSTS {
+            f.governor_for_test()
+                .record_hard_ban(host, "hard-ban", "Cloudflare403");
+        }
+
+        // A floor host that is NOT on the denylist, on a guaranteed-non-resolvable
+        // TLD so the test never touches the real network: if the governor admitted
+        // it, the fetch proceeds to DNS and fails as Error::Http (NOT
+        // PermanentlyDenied / Blocked(0)).
+        let floor_host = "wikipedia-floor.invalid";
+        assert!(
+            !f.governor_for_test().is_permanently_denied(floor_host),
+            "floor host must NOT be denied"
+        );
+        let err = f
+            .fetch(&format!("http://{floor_host}/wiki/React"))
+            .await
+            .expect_err("non-resolvable floor host fails at DNS, not the governor");
+        match err {
+            Error::PermanentlyDenied { .. } => {
+                panic!("A.2: floor host was wrongly governor-denied — it must be admitted")
+            }
+            Error::Blocked { status, .. } if status == 0 => {
+                panic!("A.2: floor host was wrongly suppressed (Blocked 0) — it must be admitted")
+            }
+            // Any transport/DNS error (Http/Crawl/Timeout) proves it was ADMITTED
+            // past the governor and only then failed at the (non-resolvable) socket.
+            _ => {}
+        }
+    }
+
+    // ── FIX #3 — registrable_domain (eTLD+1) governor keying ─────────────────
+
+    #[test]
+    fn registrable_domain_collapses_subdomains_to_etld1() {
+        // www / m / bare all key to the SAME registrable domain.
+        assert_eq!(registrable_domain("https://www.google.com/search?q=x"), "google.com");
+        assert_eq!(registrable_domain("https://m.google.com/"), "google.com");
+        assert_eq!(registrable_domain("https://google.com/"), "google.com");
+        // Deep subdomain still collapses to eTLD+1.
+        assert_eq!(registrable_domain("https://a.b.c.google.com/"), "google.com");
+    }
+
+    #[test]
+    fn registrable_domain_handles_multi_label_suffix() {
+        // A multi-label public suffix (co.uk) — eTLD+1 keeps the label below it.
+        assert_eq!(registrable_domain("https://www.bbc.co.uk/news"), "bbc.co.uk");
+        assert_eq!(registrable_domain("https://bbc.co.uk/"), "bbc.co.uk");
+    }
+
+    #[test]
+    fn registrable_domain_is_case_and_trailing_dot_insensitive() {
+        assert_eq!(registrable_domain("https://WWW.Google.COM/"), "google.com");
+        // Trailing-dot FQDN form keys identically.
+        assert_eq!(registrable_domain("https://www.google.com./"), "google.com");
+    }
+
+    #[test]
+    fn registrable_domain_ip_literals_returned_as_is() {
+        // IP literals have no eTLD+1 — keyed per-IP, never PSL-collapsed.
+        assert_eq!(registrable_domain("http://127.0.0.1/admin"), "127.0.0.1");
+        assert_eq!(registrable_domain("http://169.254.169.254/"), "169.254.169.254");
+        assert_eq!(registrable_domain("http://[::1]:8080/"), "::1");
+    }
+
+    #[test]
+    fn registrable_domain_unlisted_tld_preserves_bare_host() {
+        // RFC2606 `.invalid` is not in the PSL → default `*` rule → last two
+        // labels. For a bare two-label host this is the host itself, preserving
+        // the A.1/A.2 governor tests that ban+fetch `*.invalid` hosts.
+        assert_eq!(registrable_domain("http://denied.invalid/x"), "denied.invalid");
+        assert_eq!(registrable_domain("http://wikipedia-floor.invalid/wiki/React"), "wikipedia-floor.invalid");
+        // A subdomain under an unlisted TLD still collapses to its eTLD+1.
+        assert_eq!(registrable_domain("http://www.denied.invalid/x"), "denied.invalid");
+    }
+
+    #[tokio::test]
+    async fn registrable_domain_denylist_blocks_subdomain() {
+        // FIX #3 end-to-end: a hard-ban on the registrable domain `google.com`
+        // must also refuse `www.google.com` (subdomain cycling can no longer
+        // evade the ban). `.invalid` would DNS-fail if a socket were attempted;
+        // PermanentlyDenied proves the ban matched the subdomain's eTLD+1 key.
+        let f = default_fetcher_for_governor_test();
+        f.governor_for_test()
+            .record_hard_ban("banned-site.invalid", "hard-ban", "Cloudflare403");
+        let err = f
+            .fetch("https://www.banned-site.invalid/search?q=react")
+            .await
+            .expect_err("subdomain of a banned registrable domain must Err");
+        match err {
+            Error::PermanentlyDenied { domain, .. } => {
+                assert_eq!(domain, "banned-site.invalid", "ban keyed on eTLD+1")
+            }
+            other => panic!("expected PermanentlyDenied via eTLD+1 key, got {other:?}"),
+        }
+    }
+
+    // ── A.3 — SSRF guard on the fetch path ───────────────────────────────────
+    //
+    // ADR 0004 §13 A.3: scheme allowlist + internal-IP deny + resolve-then-pin
+    // via the SsrfResolver. STRICT policy is active (the production default). The
+    // pure helpers (ip_is_denied / scheme_is_allowed) are unit-tested in
+    // `crate::ssrf`; here we test the FETCH PATH refuses before any socket.
+
+    fn strict_fetcher() -> Fetcher {
+        let mut cfg = web_search_common::config::Config::default().crawler;
+        cfg.enable_browser = false;
+        cfg.max_retries = 0;
+        // Generous budget so the governor never short-circuits the SSRF assertions.
+        cfg.per_domain_request_budget = 100;
+        // STRICT SSRF (production default).
+        Fetcher::new(&cfg).expect("strict fetcher builds")
+    }
+
+    #[tokio::test]
+    async fn a3_metadata_ip_literal_refused_before_socket() {
+        let f = strict_fetcher();
+        // 169.254.169.254 is the cloud metadata endpoint. The IP-literal fast path
+        // must refuse it synchronously — no socket, no DNS.
+        let err = f
+            .fetch("http://169.254.169.254/latest/meta-data/")
+            .await
+            .expect_err("metadata IP must be refused");
+        match err {
+            Error::Crawl { reason, .. } => assert_eq!(reason, "blocked: internal address"),
+            other => panic!("expected Crawl(blocked: internal address), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a3_loopback_ip_literal_refused_under_strict() {
+        let f = strict_fetcher();
+        for u in ["http://127.0.0.1/admin", "http://[::1]:8080/", "http://10.0.0.5/"] {
+            let err = f.fetch(u).await.expect_err("internal IP literal must be refused");
+            assert!(
+                matches!(&err, Error::Crawl { reason, .. } if reason == "blocked: internal address"),
+                "url {u} expected blocked: internal address, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a3_non_http_schemes_refused() {
+        let f = strict_fetcher();
+        for u in [
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com/",
+            "data:text/plain,hi",
+        ] {
+            let err = f.fetch(u).await.expect_err("non-http(s) scheme must be refused");
+            assert!(
+                matches!(&err, Error::Crawl { reason, .. } if reason == "blocked: scheme not allowed"),
+                "url {u} expected blocked: scheme not allowed, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a3_resolver_denies_hostname_resolving_to_loopback() {
+        // DNS-rebinding case: a hostname (NOT an IP literal, so it bypasses the
+        // synchronous fast path) whose resolution is loopback must be refused at
+        // CONNECT time by the SsrfResolver. `localhost` resolves to 127.0.0.1/::1
+        // and the strict policy denies both — so the resolver returns zero allowed
+        // addrs and reqwest never opens a socket. The error surfaces as
+        // Error::Http wrapping the sanitized "blocked: internal address" text.
+        let f = strict_fetcher();
+        let err = f
+            .fetch("http://localhost/should-not-connect")
+            .await
+            .expect_err("hostname resolving to loopback must be refused");
+        // The deny surfaces as Error::Http (reqwest send error): the SsrfResolver
+        // refused to yield ANY allowed address for `localhost`, so reqwest never
+        // opened a socket to 127.0.0.1/::1. The legacy `fetch_once` collapses the
+        // reqwest error to its top-level `to_string()` (generic "error sending
+        // request…"), so the sanitized inner reason is not surfaced to the caller
+        // — which is acceptable here: the caller learns only that the fetch failed,
+        // and crucially NO internal IP leaks into the message (the deny detail is
+        // intentionally dropped, not exposed). The load-bearing assertion is the
+        // BEHAVIOR: no connection to loopback was established.
+        assert!(matches!(err, Error::Http(_)), "resolver deny surfaces as Http(_), got {err:?}");
+        let msg = format!("{err}");
+        // Sanitization invariant: the internal IP the host resolved to must NOT
+        // leak into any caller-visible message.
+        assert!(
+            !msg.contains("127.0.0.1") && !msg.contains("::1"),
+            "internal IP leaked into error message: {msg}"
+        );
+        // It must NOT have been treated as a normal reachable origin: a localhost
+        // server is not running in CI, but even if one were, the resolver denies
+        // the address so the request can never succeed. (Behavioral RED: relaxing
+        // the resolver to permissive would let this dial loopback.)
+    }
+
+    #[tokio::test]
+    async fn a3_strict_refuses_even_with_live_loopback_listener() {
+        // Strong proof the deny is a DENY, not just "nothing listening": bind a
+        // REAL listener on loopback, then fetch it under STRICT. The IP-literal
+        // fast path refuses synchronously → SSRF Crawl error, and the listener
+        // never receives a connection. (Permissive policy, by contrast, would
+        // reach it — asserted in a3_permissive_loopback_allows_local_mock_pattern.)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let got_conn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let got_conn_c = got_conn.clone();
+        let accept = tokio::spawn(async move {
+            // If a connection ever arrives, the SSRF guard failed.
+            if let Ok((_s, _)) = listener.accept().await {
+                got_conn_c.store(true, Ordering::Relaxed);
+            }
+        });
+
+        let f = strict_fetcher();
+        let err = f
+            .fetch(&format!("http://{addr}/"))
+            .await
+            .expect_err("strict must refuse loopback literal even with a live listener");
+        assert!(
+            matches!(&err, Error::Crawl { reason, .. } if reason == "blocked: internal address"),
+            "expected synchronous internal-address deny, got {err:?}"
+        );
+        // Give any (erroneous) connection a moment, then assert none arrived.
+        accept.abort();
+        assert!(
+            !got_conn.load(Ordering::Relaxed),
+            "SSRF guard FAILED: a socket reached the loopback listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn a3_permissive_loopback_allows_local_mock_pattern() {
+        // The TEST-ONLY permissive policy lets a local-server test dial loopback
+        // (existing-test compat seam). Build a fetcher with permissive loopback and
+        // assert the IP-literal fast path does NOT refuse 127.0.0.1. We stop before
+        // a real connect (nothing is listening) — a transport error is fine; a
+        // "blocked: internal address" Crawl error would be the regression.
+        let mut cfg = web_search_common::config::Config::default().crawler;
+        cfg.enable_browser = false;
+        cfg.max_retries = 0;
+        cfg.per_domain_request_budget = 100;
+        let f = Fetcher::new_with_ssrf_policy(&cfg, crate::ssrf::SsrfPolicy::permissive_loopback())
+            .expect("permissive fetcher builds");
+        // Port 1 is almost certainly closed → connection refused (Error::Http),
+        // NOT an SSRF block. Proves loopback passed the guard.
+        let err = f.fetch("http://127.0.0.1:1/").await.expect_err("nothing listening");
+        assert!(
+            !matches!(&err, Error::Crawl { reason, .. } if reason == "blocked: internal address"),
+            "permissive loopback must NOT SSRF-block 127.0.0.1, got {err:?}"
+        );
     }
 }

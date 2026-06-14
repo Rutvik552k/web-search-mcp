@@ -32,6 +32,10 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 parking_lot = "0.12"
 moka = { workspace = true }
+# Public Suffix List (Mozilla) compiled to native Rust — used to derive the
+# registrable domain (eTLD+1) for governor keying (FIX #3). Embedded list, no
+# runtime network/file. Dual MIT/Apache-2.0 (permissive — licensing domain OK).
+psl = "2"
 
 # Browser support (optional) — uses tokio runtime, not default async-std
 chromiumoxide = { version = "0.7", optional = true, default-features = false, features = ["tokio-runtime"] }

@@ -1,6 +1,7 @@
 use rmcp::ServiceExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod config_resolver;
 mod server;
 mod tools;
 

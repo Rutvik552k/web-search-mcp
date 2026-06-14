@@ -2915,6 +2915,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.213"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04e78830163eebdf905adb55ba26ba9b3ba554b08bd84c2fbe3b643c8addf22c"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
 name = "psl-types"
 version = "2.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4842,6 +4851,7 @@ dependencies = [
  "moka",
  "nonzero_ext",
  "parking_lot",
+ "psl",
  "regex",
  "reqwest",
  "scraper",
@@ -4869,10 +4879,13 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "siphasher",
+ "tempfile",
  "tokenizers",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "web-search-common",
 ]
 
@@ -4937,6 +4950,7 @@ name = "web-search-orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bincode",
  "chrono",
  "dashmap",

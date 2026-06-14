@@ -11,6 +11,7 @@ pub mod pagination;
 pub mod robots;
 pub mod search_results;
 pub mod sitemap;
+pub mod ssrf;
 pub mod throttle;
 pub mod crawler;
 

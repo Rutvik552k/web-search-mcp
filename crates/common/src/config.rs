@@ -39,6 +39,29 @@ pub struct CrawlerConfig {
     #[serde(default)]
     pub searxng_url: Option<String>,
 
+    // -- Self-contained search source (ADR 0004 §8) --------------------------
+    // All additive / off-safe. The DEFAULT ("auto" with no key/searxng_url)
+    // resolves to the governed crawler-seeds floor — the product runs fully
+    // standalone with no key and no container (ADR 0004 §2.2).
+    /// Search source resolution. "auto" (DEFAULT) = keyed-api if a key is set,
+    /// else searxng_url if set, else crawler-seeds. Other values pin one source:
+    /// "crawler" | "tavily" | "searxng" — used for testing/forcing the floor.
+    #[serde(default = "default_search_source")]
+    pub search_source: String,
+    /// Optional keyed search-API provider. None/"" => no keyed source.
+    /// "tavily" (recommended; true no-card free tier) | "serper" | ... .
+    #[serde(default)]
+    pub search_api_provider: Option<String>,
+    /// NAME of the env var holding the search-API key — NEVER the key itself
+    /// (api-security SECRETS MANAGEMENT; mirrors captcha_api_key_env). The key is
+    /// read via `std::env::var(<this name>)` at construction time and is never
+    /// logged. None => keyless.
+    #[serde(default)]
+    pub search_api_key_env: Option<String>,
+    /// Bounded wait for the keyed-API request, in seconds. Default 5.
+    #[serde(default = "default_search_api_timeout_secs")]
+    pub search_api_timeout_secs: u64,
+
     // -- R4 stealth headless (Design 0004 Part 1; ADR 0003 R4) ----------------
     // All default-OFF / off-safe. When `enable_stealth == false` the browser
     // path is byte-for-byte the legacy SPA-render behavior. These only take
@@ -198,6 +221,14 @@ fn default_captcha_timeout_secs() -> u64 {
     120
 }
 
+fn default_search_source() -> String {
+    "auto".to_string()
+}
+
+fn default_search_api_timeout_secs() -> u64 {
+    5
+}
+
 fn default_captcha_session_cost_cap_usd() -> f64 {
     5.0
 }
@@ -297,8 +328,30 @@ pub struct EmbedderConfig {
     pub embedding_dim: usize,
     /// Batch size for embedding generation
     pub batch_size: usize,
-    /// Force CPU even if GPU available
+    /// Force CPU even if GPU available.
+    ///
+    /// MEANING CHANGED (ADR 0004 §6.3 / A.7): `force_cpu` now means "run the
+    /// neural model on CPU" — it NO LONGER skips the neural embedder and drops
+    /// to keyword hashing. The old "skip neural" behavior silently destroyed
+    /// semantic quality and was removed. To explicitly opt into keyword-only
+    /// hashing, set `embedder_backend = "hash"` (below), not `force_cpu`.
     pub force_cpu: bool,
+    /// Optional directory of pre-staged model files for air-gapped/offline use
+    /// (ADR 0004 §6.2). None => auto-fetch from HF on first run (default). When
+    /// set and present, loaded instead of fetching. Files in this directory are
+    /// checksum-verified against `checksums.sha256` before load (ADR 0004 A.5).
+    #[serde(default)]
+    pub models_dir: Option<PathBuf>,
+    /// Embedder backend selection (ADR 0004 §6.3 / A.7 escape hatch).
+    /// - `None` (DEFAULT) => auto: attempt the neural embedder (candle), and
+    ///   fall back to keyword hashing ONLY if the neural model genuinely cannot
+    ///   load (offline/load failure) or the `candle` feature isn't compiled.
+    /// - `Some("neural")` => force the neural embedder; init failure is fatal.
+    /// - `Some("hash")` => explicitly use the keyword-hashing embedder (the old
+    ///   "fast, no-neural" capability — preserved as an explicit opt-in so the
+    ///   §6.3 meaning change to `force_cpu` does not silently delete it).
+    #[serde(default)]
+    pub embedder_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +409,10 @@ impl Default for Config {
                 max_retries: 3,
                 backoff_base_ms: 1000,
                 searxng_url: None,
+                search_source: default_search_source(),
+                search_api_provider: None,
+                search_api_key_env: None,
+                search_api_timeout_secs: default_search_api_timeout_secs(),
                 enable_stealth: false,
                 stealth_user_agent: None,
                 stealth_locale: None,
@@ -409,6 +466,8 @@ impl Default for Config {
                 embedding_dim: 384,
                 batch_size: 32,
                 force_cpu: false,
+                models_dir: None,
+                embedder_backend: None,
             },
             ranker: RankerConfig {
                 cross_encoder_model_path: PathBuf::from("models/cross-encoder.onnx"),
@@ -509,5 +568,75 @@ mod tests {
         assert!(!cfg.crawler.enable_captcha_solver);
         assert!(!cfg.crawler.captcha_run_opt_in);
         assert!(cfg.crawler.captcha_provider.is_none());
+    }
+
+    /// ADR 0004 §8 / Addendum A.6.7: a legacy `[crawler]`/`[embedder]` TOML with
+    /// NO `search_*` / `models_dir` keys must keep parsing and yield the
+    /// off-safe self-contained defaults (search_source="auto", keyless,
+    /// timeout=5, models_dir=None). Guards the additive-`#[serde(default)]`
+    /// contract for the self-contained-deploy fields.
+    #[test]
+    fn legacy_config_parses_with_search_defaults_auto() {
+        let crawler_src = r#"
+            num_workers = 8
+            max_concurrent_connections = 500
+            requests_per_second_per_domain = 2.0
+            request_timeout_secs = 30
+            user_agent = "WebSearchMCP/0.1 (research-bot)"
+            respect_robots_txt = true
+            enable_browser = false
+            max_retries = 3
+            backoff_base_ms = 1000
+        "#;
+        let crawler: CrawlerConfig =
+            toml::from_str(crawler_src).expect("legacy crawler config must parse");
+        assert_eq!(crawler.search_source, "auto");
+        assert!(crawler.search_api_provider.is_none());
+        assert!(crawler.search_api_key_env.is_none());
+        assert_eq!(crawler.search_api_timeout_secs, 5);
+
+        let embedder_src = r#"
+            embedding_model_path = "models/minilm-l6-v2.onnx"
+            embedding_dim = 384
+            batch_size = 32
+            force_cpu = false
+        "#;
+        let embedder: EmbedderConfig =
+            toml::from_str(embedder_src).expect("legacy embedder config must parse");
+        assert!(embedder.models_dir.is_none());
+        // ADR 0004 A.7: the escape-hatch field must default None (auto =
+        // attempt-neural-then-degrade) and a legacy TOML without the key parses.
+        assert!(embedder.embedder_backend.is_none());
+    }
+
+    /// ADR 0004 Addendum A.6.7: the *actual shipped* `config/default.toml` (which
+    /// has NO `search_*` / `models_dir` keys) must parse under the new struct.
+    /// Catches struct/file drift — if a required field is added without a serde
+    /// default, this fails.
+    #[test]
+    fn shipped_default_toml_roundtrips() {
+        // CARGO_MANIFEST_DIR = crates/common ; the shipped file is at the repo
+        // root under config/default.toml (two levels up).
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir.join("../../config/default.toml");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read shipped config {}: {e}", path.display()));
+        let cfg: Config = toml::from_str(&content)
+            .unwrap_or_else(|e| panic!("shipped config/default.toml must parse: {e}"));
+        // The shipped file carries no search_* keys → serde defaults apply.
+        assert_eq!(cfg.crawler.search_source, "auto");
+        assert!(cfg.crawler.search_api_provider.is_none());
+        assert!(cfg.crawler.search_api_key_env.is_none());
+        assert_eq!(cfg.crawler.search_api_timeout_secs, 5);
+        assert!(cfg.embedder.models_dir.is_none());
+        assert!(cfg.embedder.embedder_backend.is_none());
+    }
+
+    /// ADR 0004 A.7: `Config::default()` must carry the escape-hatch field as
+    /// None (auto). Guards against a non-None default silently forcing a backend.
+    #[test]
+    fn default_config_embedder_backend_is_none() {
+        let cfg = Config::default();
+        assert!(cfg.embedder.embedder_backend.is_none());
     }
 }

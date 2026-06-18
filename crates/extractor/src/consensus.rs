@@ -118,6 +118,13 @@ pub fn extract_page_with_config(html: &str, url: &str, cfg: &ExtractorConfig) ->
     result
 }
 
+/// When one extraction pass produces a body this many times larger (in chars)
+/// than the other, prefer the larger one regardless of the per-pass confidence
+/// score. Confidence is coarse and can rank a thin fragment above the full body
+/// (see `extract_base`); completeness breaks that tie. A 3x gap is far beyond
+/// normal pass-to-pass variance, so this only fires on genuine truncation.
+const SUBSTANTIALLY_RICHER_RATIO: usize = 3;
+
 /// The original consensus extraction. Kept separate so [`extract_page`] stays
 /// byte-for-byte identical regardless of data-layer changes.
 fn extract_base(html: &str, url: &str) -> ExtractionResult {
@@ -131,8 +138,23 @@ fn extract_base(html: &str, url: &str) -> ExtractionResult {
         || readability::extract(&clean_for_read),
     );
 
-    // Pick best body text by confidence, then clean
-    let (body_text, confidence) = if traf_result.confidence >= read_result.confidence {
+    // Pick best body text. Confidence is a coarse quality signal (trafilatura
+    // reports a flat 0.85 for any page with >2 blocks and >300 chars), so on long
+    // articles a high-confidence pass can still capture only a small fragment while
+    // the other pass recovers the full body. Guard against that: if one pass yields
+    // a *substantially* larger body, prefer it regardless of the confidence tie.
+    // Otherwise fall back to confidence (preserving prior behavior).
+    let traf_len = traf_result.body_text.chars().count();
+    let read_len = read_result.body_text.chars().count();
+    let pick_trafilatura = if traf_len > read_len.saturating_mul(SUBSTANTIALLY_RICHER_RATIO) {
+        true
+    } else if read_len > traf_len.saturating_mul(SUBSTANTIALLY_RICHER_RATIO) {
+        false
+    } else {
+        traf_result.confidence >= read_result.confidence
+    };
+
+    let (body_text, confidence) = if pick_trafilatura {
         (clean_css_artifacts(&traf_result.body_text), traf_result.confidence)
     } else {
         (clean_css_artifacts(&read_result.body_text), read_result.confidence)

@@ -1,0 +1,7 @@
+# Node deps for rearm_gateway.mjs — reinstall with `npm install` (package.json committed)
+node_modules/
+package-lock.json
+# Runtime state the MCP server writes when the gateway runs with this dir as cwd
+data/
+# Any local logs
+*.log

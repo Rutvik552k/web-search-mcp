@@ -248,24 +248,115 @@ What is **operator-run** (needs the judge key / paid LLM): the actual
 
 ---
 
-## Known gotchas / concerns
+## PREP STATE (2026-06-18) — harness made keyed-run-ready
 
-1. **supergateway is single-SSE-session per process (current build).** After one
-   SSE session closes, a second connection throws
-   `Already connected to a transport` and the gateway exits. MCPBench opens a
-   fresh `SyncedMcpClient` (new SSE session) per `list_tools`/`call_tool`, so on
-   this build the gateway will die after the first question. Our verification
-   ran list_tools + call_tool **in one session** to stay clear of this. If the
-   full run hits this, the fix is on the harness side, not our server: pin a
-   supergateway version that re-arms the child transport, or restart the gateway
-   per request. (Class of bug: see MCP-SuperAssistant issues #183/#194.) This is
-   an MCPBench/supergateway environment matter — flag to operator.
-2. **Windows path mangling (Git Bash/MSYS only).** `--ssePath /sse` gets
-   rewritten to `C:/Program Files/Git/sse`. Run with `MSYS_NO_PATHCONV=1` and a
-   Windows-style binary path, or run under WSL/Linux (MCPBench's `.sh` scripts
-   assume bash on Linux). Not an issue on native Linux.
-3. **serverInfo name is `rmcp`, not `web-search-mcp`.** Cosmetic — MCPBench
-   keys the server by the `name` field in the JSON config, not MCP serverInfo.
-4. **Judge model pinned to `deepseek-v3`.** The operator's endpoint must serve
-   it (DashScope does). Changing it requires editing MCPBench
-   (`mcp_program.py`), out of scope here.
+Everything below was set up + verified **without a key** so the operator's
+single keyed run works first try. External MCPBench clone lives at WSL path
+**`~/MCPBench`** (`\\wsl$\Ubuntu\home\rutvik\MCPBench`), HEAD
+`5f397445370e6cb44dfdfc5680a48f128a75d349` (2025-09-03). WSL venv:
+**`~/mcpbench-venv`** (Ubuntu, Python 3.12).
+
+### 1. supergateway re-arm bug — FIXED with a custom gateway (not a version pin)
+
+The bug is **structural in supergateway through 3.4.3 (latest)**, not fixed in
+any published version. Root cause (read in `dist/gateways/stdioToSse.js`): ONE
+`@modelcontextprotocol/sdk` `Server` is created at startup and `server.connect()`
+is called on EVERY `GET /sse`. The SDK's `Protocol.connect()` throws
+`Already connected to a transport` on the 2nd connect. Reproduced under WSL:
+session 1 OK → session 2 = `RemoteProtocolError: Server disconnected` +
+`Error: Already connected to a transport ... protocol.js:217` in the gateway log.
+
+**Fix:** `rearm_gateway.mjs` (this dir) — a supergateway-CLI-compatible drop-in
+that spawns a FRESH `Server` + FRESH child stdio process **per SSE connection**
+and tears both down on close. No `Server`/transport is ever reused. Deps
+(`@modelcontextprotocol/sdk@1.29.0`, `express@4`, `body-parser@1`) installed in
+`benchmark/mcpbench/node_modules` (run gateway from this dir so node resolves
+them). Launch with `launch_rearm_gateway.sh`.
+
+**2-session proof** (`verify_two_sessions.py`, mirrors MCPBench's fresh-session-
+per-call pattern):
+- stock supergateway@3.4.3 → session 2 FAILS (exit 3, "Already connected").
+- `rearm_gateway.mjs` → BOTH sessions do initialize + list_tools(15) +
+  call_tool(instant_search, isError=False) and close cleanly (exit 0).
+- Confirmed under the REAL MCPBench loop (dataset_mode=test, fake key): the
+  gateway opened **2 sequential sessions** (distinct child pids), one per QA pair.
+
+### 2. Judge model patched to OpenAI
+
+`api.openai.com` serves `gpt-4o-mini`, NOT `deepseek-v3`. Both the agent
+(`--lm`) and judge use `program_utils.call_lm` →
+`OpenAI(base_url=lm_api_base, api_key=lm_api_key)` then `model.split('/')`
+(prefix must be `openai`). The judge model is hardcoded separately.
+
+**Patched files/lines (in the WSL clone `~/MCPBench`):**
+- `langProBe/mcp_program.py:120` — `answer_eval_manager.model = "openai/deepseek-v3"`
+  → `"openai/gpt-4o-mini"`. Original saved as `langProBe/mcp_program.py.orig`.
+- Agent model + base + key are passed as CLI flags (no edit): `--lm=openai/gpt-4o-mini`,
+  `--lm_api_base=https://api.openai.com/v1`, `--lm_api_key=$OPENAI_API_KEY`.
+
+That single line is the only judge edit needed — one OpenAI key + base serves
+both agent and judge with `gpt-4o-mini`.
+
+### 3. dspy MUST be pinned `<3` (would otherwise break the keyed run)
+
+MCPBench `requirements.txt` says `dspy>=2.6` but was authored for 2.6.x. dspy
+**3.x removed `Evaluate(return_outputs=...)`** → `ValueError: return_outputs is
+no longer supported` at `benchmark.py:209`, killing the run before any question.
+Also `pandas` is imported (`analysis.py`) but missing from requirements.txt.
+**Both fixed in the venv:** `dspy==2.6.27` pinned, `pandas` installed. Verified
+the full eval loop runs to completion under dspy 2.6.27 (only the fake-key 401
+remains, as expected).
+
+### 4. Linux/WSL invocation (Git Bash mangles paths — do NOT use it)
+
+Git Bash rewrites `--ssePath /sse` → `C:/Program Files/Git/sse` and cannot spawn
+the `.exe` cleanly (`shell:true` → "system cannot find the path"). Run under
+**WSL/Linux**. WSL interop launches the Windows `.exe` via `/mnt/c/...` and it
+responds to MCP correctly (verified). Config
+`configs/mcp_config_websearch_ours.json` uses the WSL path
+`/mnt/c/Users/rutvi/Downloads/projects/web_search_mcp/target/release/web-search-mcp.exe`
+and `port: 8005`; MCPBench builds `http://localhost:8005/sse` from it
+(`program_utils.py:166`) and does NOT auto-spawn the gateway — you launch it.
+
+### EXACT KEYED RUN (operator runs this; key from env, never written anywhere)
+
+**Terminal A (WSL) — start the re-arm gateway, leave it running:**
+```bash
+cd /mnt/c/Users/rutvi/Downloads/projects/web_search_mcp/benchmark/mcpbench
+bash launch_rearm_gateway.sh        # listens on :8005 /sse; re-arms per session
+```
+
+**Terminal B (WSL) — SMOKE first (2 pairs), then FULL (600). `OPENAI_API_KEY`
+comes from your env; it is NOT in any file:**
+```bash
+cd ~/MCPBench
+# --- SMOKE: dataset_mode=test = 2 QA pairs (confirm spend + wiring) ---
+DSPY_CACHEDIR=evaluation_mcp/.dspy_cache ~/mcpbench-venv/bin/python -c "
+import multiprocessing as mp; mp.set_start_method('spawn', True)
+from langProBe.evaluation import main; main()" \
+  --benchmark=WebSearch --dataset_mode=test \
+  --dataset_path=langProBe/WebSearch/data/websearch_600.jsonl \
+  --file_path=evaluation_websearch_ours \
+  --lm=openai/gpt-4o-mini \
+  --lm_api_base=https://api.openai.com/v1 \
+  --lm_api_key="$OPENAI_API_KEY" \
+  --num_threads=1 \
+  --config=configs/mcp_config_websearch_ours.json
+
+# --- FULL: dataset_mode=full = all 600 QA pairs (G3) ---
+#     same command, change ONLY: --dataset_mode=full
+```
+> `dataset_mode=test` = 2 pairs (`benchmark.py:19` dataset_size, the in-place
+> re-trim to 50 is a no-op on a 2-item set). `full` = all 600.
+> `score` in `evaluation_websearch_ours/MCP_WEBSEARCH_MCPPredict.txt` is **G3**.
+> Then fold G3 into G4: see "Feeding G3 into G4" above
+> (`--accuracy-ours` / `--accuracy-firecrawl`).
+
+> COST/SAFETY: ~600 agent loops + 600 judge calls on gpt-4o-mini = a paid
+> OpenAI run YOU own. Run the SMOKE first and check the bill before `full`.
+
+### Other notes
+- **serverInfo name is `rmcp`.** Cosmetic — MCPBench keys the server by the JSON
+  config `name`, not MCP serverInfo.
+- A Firecrawl-side G3 (for the G4 accuracy delta) needs an identical MCPBench run
+  pointed at a Firecrawl MCP config + the same judge — out of scope for this prep.

@@ -265,9 +265,16 @@ pub fn build_report(
     out.push_str(&format!("- **Git SHA:** `{git_sha}`\n"));
     out.push_str(&format!("- **Inputs:** `{urls_path}` (identical set, both sides)\n"));
     out.push_str(&format!("- **Our server:** `{server}`\n"));
+    // Reflect the ACTUAL base the run hit (self-hosted localhost for the G4
+    // baseline, per GOAL.md §G4), not the cloud default — so the report does not
+    // misrepresent a self-host run as a cloud-API run.
+    let fc_base = std::env::var("FIRECRAWL_BASE_URL")
+        .unwrap_or_else(|_| firecrawl::DEFAULT_BASE_URL.to_string());
+    let fc_is_selfhost = fc_base.contains("localhost") || fc_base.contains("127.0.0.1");
     out.push_str(&format!(
-        "- **Firecrawl:** v2 API (`{}`), baseline-comparison only — never a runtime dependency (GOAL.md Mission: API-free)\n",
-        firecrawl::DEFAULT_BASE_URL
+        "- **Firecrawl:** v2 API (`{}`){}, baseline-comparison only — never a runtime dependency (GOAL.md Mission: API-free)\n",
+        fc_base,
+        if fc_is_selfhost { " — **self-hosted locally** (no Fire-engine)" } else { "" }
     ));
     out.push_str(&format!("- **Cost basis:** {}\n\n", firecrawl::COST_BASIS_NOTE));
 
@@ -294,6 +301,16 @@ pub fn build_report(
              > pass/fail are marked N/A until the operator provides `FIRECRAWL_API_KEY`\n\
              > and re-runs on identical inputs/hardware/date.\n\n",
         ));
+    } else if fc_is_selfhost {
+        // GOAL.md §G4 blocked-tier caveat — REQUIRED on any self-host run.
+        out.push_str(
+            "> ⚠️ **BLOCKED-TIER CAVEAT (GOAL.md §G4).** This Firecrawl side ran \
+             **self-hosted**, which has **no Fire-engine**. Self-host is therefore weaker on \
+             bot-protected pages than Firecrawl's paid cloud. The blocked-subset (G2) number \
+             here is a **FLOOR for Firecrawl, not its cloud ceiling** — a G2 win over self-host \
+             is **not** a win over cloud Firecrawl. A cloud-equivalent blocked-tier comparison \
+             would require the paid cloud key (operator decision — TASKS 0.6b).\n\n",
+        );
     }
 
     // ── G4 deltas summary table ──

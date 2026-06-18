@@ -4,7 +4,7 @@
             "name": "web-search-mcp",
             "run_config": [
                 {
-                    "command": "/ABS/PATH/TO/web_search_mcp/target/release/web-search-mcp",
+                    "command": "/mnt/c/Users/rutvi/Downloads/projects/web_search_mcp/target/release/web-search-mcp.exe",
                     "args": "",
                     "port": 8005
                 }

@@ -1,0 +1,14 @@
+{
+    "mcp_pool": [
+        {
+            "name": "web-search-mcp",
+            "run_config": [
+                {
+                    "command": "/ABS/PATH/TO/web_search_mcp/target/release/web-search-mcp",
+                    "args": "",
+                    "port": 8005
+                }
+            ]
+        }
+    ]
+}

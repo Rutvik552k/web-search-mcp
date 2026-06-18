@@ -285,6 +285,16 @@ impl BrowserPool {
         use chromiumoxide::browser::{Browser, BrowserConfig};
         use futures::StreamExt;
 
+        // FIX #1 (SSRF): Chrome uses its OWN network stack, so the reqwest
+        // `SsrfResolver` does NOT protect this navigation. `new_page(url)`
+        // navigates Chrome straight at `url`, so gate it the same way the reqwest
+        // path is gated (scheme + resolve-then-deny, fail closed). Strict policy:
+        // the browser path only runs in production where loopback is denied.
+        if let Err(e) = crate::ssrf::precheck_navigation(url, crate::ssrf::SsrfPolicy::strict()).await {
+            tracing::warn!(url, reason = %e, "Browser: navigation blocked by SSRF pre-check");
+            return None;
+        }
+
         // Lazy-init browser
         let mut guard = self.browser.lock().await;
         if guard.as_ref().map(|s| s.stealth_launch).unwrap_or(false) {
@@ -406,6 +416,14 @@ impl BrowserPool {
         use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
         use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
         use futures::StreamExt;
+
+        // FIX #1 (SSRF): gate the stealth `page.goto(url)` (below) — Chrome's own
+        // network stack bypasses the reqwest `SsrfResolver`. Fail closed before
+        // launching anything.
+        if let Err(e) = crate::ssrf::precheck_navigation(url, crate::ssrf::SsrfPolicy::strict()).await {
+            tracing::warn!(url, reason = %e, "Stealth: navigation blocked by SSRF pre-check");
+            return None;
+        }
 
         let cfg = self.stealth.as_ref()?.clone();
 
@@ -625,6 +643,13 @@ impl BrowserPool {
         use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
         use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
         use futures::StreamExt;
+
+        // FIX #1 (SSRF): gate the `page.goto(url)` below — Chrome bypasses the
+        // reqwest `SsrfResolver`. Fail closed before launching anything.
+        if let Err(e) = crate::ssrf::precheck_navigation(url, crate::ssrf::SsrfPolicy::strict()).await {
+            tracing::warn!(url, reason = %e, "solve_in_page: navigation blocked by SSRF pre-check");
+            return None;
+        }
 
         let cfg = self.stealth.as_ref()?.clone();
 

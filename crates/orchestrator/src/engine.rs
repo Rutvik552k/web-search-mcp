@@ -7,7 +7,7 @@ use web_search_common::Result;
 use crate::persistent_cache::PersistentCache;
 use crate::synthesis;
 use web_search_crawler::Crawler;
-use web_search_embedder::{self, Embedder};
+use web_search_embedder::{self, Embedder, EmbedderHealth};
 use web_search_extractor::{self, consensus};
 use web_search_indexer::dedup::{DedupResult, DedupStore};
 use web_search_indexer::hnsw::HnswIndex;
@@ -53,6 +53,10 @@ pub struct SearchEngine {
     vector_index: HnswIndex,
     dedup: DedupStore,
     embedder: Box<dyn Embedder>,
+    /// Observable embedder health (ADR 0004 A.6.1) — distinguishes a healthy
+    /// neural embedder from a degraded keyword-only fallback, carrying the
+    /// reason. The server can surface this as a capability/health flag.
+    embedder_health: EmbedderHealth,
     pipeline: RankingPipeline,
     _config: Config,
     /// Optional progress callback for long-running operations
@@ -72,6 +76,11 @@ pub struct SearchEngine {
     _flush_handle: Option<tokio::task::JoinHandle<()>>,
     /// Background crawl daemon — pre-indexes content before queries arrive.
     daemon: std::sync::OnceLock<crate::daemon::CrawlDaemon>,
+    /// Search-source selector (ADR 0004 §3) — built once from config. Replaces
+    /// the hardcoded `if searxng_url` branch in quick_search / instant_search.
+    /// Empty (no key, no searxng_url under "auto", or pinned "crawler") ⇒ the
+    /// engine falls straight through to the frontier floor.
+    selector: crate::selector::SearchSelector,
 }
 
 impl SearchEngine {
@@ -108,7 +117,10 @@ impl SearchEngine {
         let dedup_path = data_dir.join("dedup.json");
         let dedup = DedupStore::open_or_create(&dedup_path, config.indexer.simhash_threshold);
         tracing::info!(urls = dedup.len(), "Dedup state ready");
-        let embedder = web_search_embedder::create_embedder(&config.embedder);
+        let (embedder, embedder_health) = web_search_embedder::create_embedder(&config.embedder);
+        if let EmbedderHealth::Degraded { reason } = &embedder_health {
+            tracing::warn!(reason = %reason, "Embedder running DEGRADED (keyword-only, no semantic matching)");
+        }
         let pipeline = RankingPipeline::new(config.ranker.clone());
 
         let (progress_tx, _) = tokio::sync::broadcast::channel(32);
@@ -210,6 +222,13 @@ impl SearchEngine {
             None
         };
 
+        // Build the search-source selector ONCE from config (ADR 0004 §3).
+        // build_sources_from_config reads the keyed-API env var (if named) and
+        // emits the §8 keyless INFO when the auto list is empty.
+        let selector = crate::selector::SearchSelector::new(
+            crate::selector::build_sources_from_config(&config.crawler),
+        );
+
         // Note: daemon is spawned lazily via start_daemon() after SearchEngine
         // is wrapped in Arc, since it needs Arc<Crawler> from the engine.
 
@@ -219,6 +238,7 @@ impl SearchEngine {
             vector_index,
             dedup,
             embedder,
+            embedder_health,
             pipeline,
             _config: config,
             progress_tx: Some(progress_tx),
@@ -228,7 +248,18 @@ impl SearchEngine {
             persistent_cache,
             _flush_handle,
             daemon: std::sync::OnceLock::new(),
+            selector,
         })
+    }
+
+    /// Observable embedder health (ADR 0004 A.6.1).
+    ///
+    /// `EmbedderHealth::Neural { .. }` => semantic embeddings are serving;
+    /// `EmbedderHealth::Degraded { reason }` => degraded to keyword-only, with a
+    /// surface-able sanitized reason. The MCP server can expose this as a
+    /// capability/health flag so the degraded state is observable, not buried.
+    pub fn embedder_health(&self) -> &EmbedderHealth {
+        &self.embedder_health
     }
 
     /// Pre-warm ML models by running a dummy embedding.
@@ -529,40 +560,39 @@ impl SearchEngine {
         // This bypasses the slow frontier queue and skips fetching 15+ SERP pages.
         let query_type = web_search_ranker::query_type::detect_query_type(query);
 
-        let (pages, used_fast_path) = if let Some(ref searxng_url) = self._config.crawler.searxng_url {
-            let searxng_results = fetch_searxng_results(searxng_url, query).await;
+        // Crawl only the top-N result URLs concurrently
+        let max_fetch = match query_type {
+            web_search_common::models::QueryType::Factual  => 8,
+            web_search_common::models::QueryType::News     => 10,
+            web_search_common::models::QueryType::Technical => 12,
+            web_search_common::models::QueryType::Research  => 15,
+            web_search_common::models::QueryType::General   => 10,
+        };
 
-            if !searxng_results.is_empty() {
-                // Crawl only the top-N result URLs concurrently
-                let max_fetch = match query_type {
-                    web_search_common::models::QueryType::Factual  => 8,
-                    web_search_common::models::QueryType::News     => 10,
-                    web_search_common::models::QueryType::Technical => 12,
-                    web_search_common::models::QueryType::Research  => 15,
-                    web_search_common::models::QueryType::General   => 10,
-                };
-                let urls: Vec<&str> = searxng_results.iter()
-                    .take(max_fetch)
-                    .map(|r| r.url.as_str())
-                    .collect();
+        // FAST PATH: ask the source selector (keyed-API → searxng-url, per
+        // config). On non-empty hits, crawl only those URLs concurrently.
+        // Empty ⇒ selector exhausted (or none configured) ⇒ frontier floor
+        // below (ADR 0004 §3 — replaces the hardcoded `if searxng_url` branch).
+        let hits = self.selector.resolve(query, max_fetch).await;
+        let (pages, used_fast_path) = if !hits.is_empty() {
+            let urls: Vec<&str> = hits.iter()
+                .take(max_fetch)
+                .map(|r| r.url.as_str())
+                .collect();
 
-                tracing::info!(
-                    query,
-                    query_type = ?query_type,
-                    searxng_results = searxng_results.len(),
-                    fetching = urls.len(),
-                    "SearXNG fast path: concurrent fetch"
-                );
+            tracing::info!(
+                query,
+                query_type = ?query_type,
+                source_hits = hits.len(),
+                fetching = urls.len(),
+                "Selector fast path: concurrent fetch"
+            );
 
-                let pages = self.crawler.fetch_urls_concurrent(
-                    &urls,
-                    Duration::from_secs(5),
-                ).await;
-                (pages, true)
-            } else {
-                tracing::info!("SearXNG returned 0 results, falling back to full crawl");
-                (Vec::new(), false)
-            }
+            let pages = self.crawler.fetch_urls_concurrent(
+                &urls,
+                Duration::from_secs(5),
+            ).await;
+            (pages, true)
         } else {
             (Vec::new(), false)
         };
@@ -751,18 +781,20 @@ impl SearchEngine {
             return Ok(cached);
         }
 
-        // 2. SearXNG snippet-only mode — no crawling at all
-        if let Some(ref searxng_url) = self._config.crawler.searxng_url {
-            let searxng_results = fetch_searxng_results(searxng_url, query).await;
+        // 2. Snippet-only mode — selector (keyed-API → searxng-url), no crawl.
+        // Empty ⇒ selector exhausted (or none configured) ⇒ frontier floor
+        // below (ADR 0004 §3 — replaces the hardcoded `if searxng_url` branch).
+        {
+            let source_hits = self.selector.resolve(query, max_results.max(10)).await;
 
-            if !searxng_results.is_empty() {
+            if !source_hits.is_empty() {
                 // Rank by query-term overlap in title + snippet
                 let query_lower = query.to_lowercase();
                 let query_terms: Vec<&str> = query_lower.split_whitespace()
                     .filter(|w| w.len() > 2)
                     .collect();
 
-                let mut results: Vec<RankedResult> = searxng_results.iter()
+                let mut results: Vec<RankedResult> = source_hits.iter()
                     .map(|sr| {
                         let domain = url::Url::parse(&sr.url)
                             .ok()
@@ -812,7 +844,7 @@ impl SearchEngine {
                 tracing::info!(
                     results = response.results.len(),
                     elapsed_ms = response.total_time_ms,
-                    "instant_search complete (SearXNG snippet-only)"
+                    "instant_search complete (selector snippet-only)"
                 );
 
                 return Ok(response);
@@ -1595,27 +1627,26 @@ impl SearchEngine {
 ///
 /// Uses multiple search engines and direct knowledge sources to maximize
 /// coverage without relying on any single API.
-/// Result from SearXNG JSON API — contains URL, title, and snippet.
-/// Used for snippet-only ranking (instant_search) and fast URL extraction.
-#[derive(Debug, Clone)]
-struct SearxngResult {
-    url: String,
-    title: String,
-    snippet: String,
-}
-
 /// Fetch SearXNG JSON API directly and return parsed results.
 /// Single HTTP request, ~200-500ms. Returns up to 20 results with snippets.
-async fn fetch_searxng_results(
+///
+/// Returns the shared `SearchHit` (ADR 0004 §3/§8 promotion — the private
+/// `SearxngResult` dup type was deleted). `pub(crate)` so `SearxngSource`
+/// (selector.rs) can wrap it as a `SearchSource`.
+pub(crate) async fn fetch_searxng_results(
     searxng_url: &str,
     query: &str,
-) -> Vec<SearxngResult> {
+) -> Vec<crate::search_source::SearchHit> {
     let encoded = urlencoding_simple(query);
     let base = searxng_url.trim_end_matches('/');
     let api_url = format!("{base}/search?q={encoded}&format=json&categories=general&pageno=1");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        // FIX #4: the SearXNG metasearch JSON endpoint must not 3xx. Disable
+        // redirect-following so a compromised/malicious SearXNG instance cannot
+        // bounce us to an internal/SSRF target via a redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
@@ -1627,15 +1658,24 @@ async fn fetch_searxng_results(
                         let mut results = Vec::new();
                         let mut seen = std::collections::HashSet::new();
                         for item in items {
+                            // FIX #7: scheme-gate AND control-char strip the url
+                            // (consistent with title/snippet sanitize) before it
+                            // reaches logs/index. `sanitize` for title/snippet.
                             let url = match item["url"].as_str() {
-                                Some(u) if u.starts_with("http") => u,
+                                Some(u) if u.starts_with("http") => {
+                                    crate::tavily::sanitize_url(u)
+                                }
                                 _ => continue,
                             };
-                            if !seen.insert(url.to_string()) { continue; }
-                            results.push(SearxngResult {
-                                url: url.to_string(),
-                                title: item["title"].as_str().unwrap_or("").to_string(),
-                                snippet: item["content"].as_str().unwrap_or("").to_string(),
+                            if !seen.insert(url.clone()) { continue; }
+                            results.push(crate::search_source::SearchHit {
+                                url,
+                                title: crate::tavily::sanitize(
+                                    item["title"].as_str().unwrap_or(""),
+                                ),
+                                snippet: crate::tavily::sanitize(
+                                    item["content"].as_str().unwrap_or(""),
+                                ),
                             });
                         }
                         tracing::info!(
@@ -1708,11 +1748,22 @@ fn generate_search_seeds(query: &str, searxng_url: Option<&str>) -> Vec<String> 
         format!("https://hn.algolia.com/api/v1/search?query={encoded}&tags=story"),
     ]);
 
-    // Add official/canonical domain seeds for detected entities
+    // Add official/canonical domain seeds for detected entities.
+    //
+    // ADR 0004 Addendum A.2 (BLOCKER-2): the Google `site:` seed alone is NOT a
+    // SERP-independent floor — it dies if Google is hard-banned (the permanent
+    // single-IP failure ADR 0003 guards against). Add a GENUINE direct
+    // `https://{domain}/` seed per detected official domain so the floor
+    // survives a full SERP ban. The direct seed is highest-priority
+    // (`insert(0, …)`); the governed Google `site:` seed is kept as an
+    // additional, lower-priority path.
     let official_domains = web_search_ranker::entity_domain::detect_official_domains(query);
     for domain in &official_domains {
-        // Site-specific search on Google to find relevant pages on the official domain
-        seeds.insert(0, format!("https://www.google.com/search?q=site%3A{domain}+{encoded}"));
+        // Site-specific search on Google to find relevant pages on the official
+        // domain (lower priority; dies under a Google ban — A.2).
+        seeds.push(format!("https://www.google.com/search?q=site%3A{domain}+{encoded}"));
+        // SERP-INDEPENDENT direct seed (A.2 floor) — survives a full SERP ban.
+        seeds.insert(0, format!("https://{domain}/"));
     }
 
     // Add topic-specific sources based on query keywords
@@ -1885,5 +1936,123 @@ mod tests {
         let config = Config::default();
         let engine = SearchEngine::new(config);
         assert!(engine.is_ok());
+    }
+
+    // ── WAVE 4 / A.2 — SERP-ban degradation floor (seed-survival) ────────────
+    //
+    // ADR 0004 §13 A.2 (BLOCKER-2): with the four SERP hosts
+    // (google/bing/duckduckgo/brave) banned, `generate_search_seeds(q, None)`
+    // MUST still yield SERP-INDEPENDENT entry points (direct `https://{domain}/`,
+    // Wikipedia, arXiv, HN-Algolia-JSON, StackExchange, Reddit). These pure
+    // unit tests prove the SEED side of A.2 (the floor *exists* in the seed set);
+    // the crawler-crate `a2_*` governor tests prove the FETCH side (the four
+    // hosts make zero socket). Together they cover A.2 — documented honestly
+    // here because the engine cannot inject a seeded-denylist crawler without a
+    // network crawl, so the two seams are split rather than faking a live crawl.
+
+    /// The four SERP hosts the A.2 acceptance criterion bans.
+    const A2_SERP_HOSTS: [&str; 4] =
+        ["google.com", "bing.com", "duckduckgo.com", "brave.com"];
+
+    /// True iff a seed URL's host is (or is a subdomain of) one of the banned
+    /// SERP hosts — the same host-suffix test a permanent denylist applies.
+    fn seed_targets_serp_host(seed: &str) -> bool {
+        let host = url::Url::parse(seed)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()));
+        match host {
+            Some(h) => A2_SERP_HOSTS
+                .iter()
+                .any(|banned| h == *banned || h.ends_with(&format!(".{banned}"))),
+            None => false,
+        }
+    }
+
+    #[test]
+    fn a2_official_domain_emits_direct_non_serp_seed() {
+        // A query with a detectable official domain (react → react.dev) MUST get a
+        // direct `https://react.dev/` seed that is NOT a SERP query. This is the
+        // genuine SERP-independent floor A.2 requires (insert(0,…) in
+        // generate_search_seeds).
+        let seeds = generate_search_seeds("react hooks tutorial", None);
+        let has_direct = seeds.iter().any(|s| s == "https://react.dev/");
+        assert!(
+            has_direct,
+            "A.2: expected a direct https://react.dev/ seed (SERP-independent floor); seeds: {seeds:?}"
+        );
+        // And that direct seed targets NONE of the banned SERP hosts.
+        assert!(
+            !seed_targets_serp_host("https://react.dev/"),
+            "the direct official-domain seed must not be a SERP host"
+        );
+    }
+
+    #[test]
+    fn a2_seed_set_survives_full_serp_ban_nonempty() {
+        // Remove every seed pointing at the four banned SERP hosts (the effect of
+        // a permanent denylist on those hosts) and assert the SURVIVING set is
+        // non-empty AND contains real SERP-independent data sources.
+        let seeds = generate_search_seeds("react hooks tutorial", None);
+        let survivors: Vec<&String> =
+            seeds.iter().filter(|s| !seed_targets_serp_host(s)).collect();
+
+        assert!(
+            !survivors.is_empty(),
+            "A.2: surviving (non-SERP) seed set must be non-empty after banning {A2_SERP_HOSTS:?}"
+        );
+
+        // The survivors must include the SERP-independent sources the ADR names
+        // as the floor: direct official domain + Wikipedia + arXiv + HN JSON +
+        // StackExchange + Reddit.
+        let joined = survivors
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("https://react.dev/"), "direct official domain must survive");
+        assert!(joined.contains("wikipedia.org"), "Wikipedia must survive");
+        assert!(joined.contains("arxiv.org"), "arXiv must survive");
+        assert!(joined.contains("hn.algolia.com"), "HN-Algolia JSON must survive");
+        assert!(joined.contains("stackexchange.com"), "StackExchange must survive");
+        assert!(joined.contains("reddit.com"), "Reddit must survive");
+    }
+
+    #[test]
+    fn a2_serp_hosts_are_actually_present_before_ban() {
+        // Guard against the test passing vacuously: confirm the unfiltered seed
+        // set DID contain SERP-host seeds (so the filter is doing real work).
+        // If generate_search_seeds ever stopped emitting SERP seeds entirely,
+        // this catches that drift instead of silently green-passing A.2.
+        let seeds = generate_search_seeds("react hooks tutorial", None);
+        let serp_seeds = seeds.iter().filter(|s| seed_targets_serp_host(s)).count();
+        assert!(
+            serp_seeds > 0,
+            "expected SERP-host seeds in the raw set (the ban must remove something real)"
+        );
+    }
+
+    #[test]
+    fn a2_generic_query_floor_survives_serp_ban() {
+        // Even a query with NO official-domain match (no direct https://{domain}/
+        // seed) must keep a non-empty SERP-independent floor: Wikipedia / arXiv /
+        // HN-JSON / StackExchange / Reddit are query-independent.
+        let seeds = generate_search_seeds("best practices for distributed systems", None);
+        // No official domain detected for this query.
+        assert!(
+            web_search_ranker::entity_domain::detect_official_domains(
+                "best practices for distributed systems"
+            )
+            .is_empty(),
+            "precondition: generic query has no official domain"
+        );
+        let survivors: Vec<&String> =
+            seeds.iter().filter(|s| !seed_targets_serp_host(s)).collect();
+        assert!(
+            !survivors.is_empty(),
+            "A.2: generic-query floor must survive a full SERP ban"
+        );
+        let joined = survivors.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("wikipedia.org"), "Wikipedia floor must survive for generic query");
+        assert!(joined.contains("hn.algolia.com"), "HN-JSON floor must survive for generic query");
     }
 }

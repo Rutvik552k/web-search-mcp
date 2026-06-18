@@ -25,6 +25,7 @@ fn spawn_progress_logger(engine: &SearchEngine) {
     }
 }
 
+use crate::config_resolver::{resolve_config_path, validate_search_config, ConfigSource};
 use crate::tools::tool_definitions;
 
 pub struct WebSearchServer {
@@ -33,8 +34,7 @@ pub struct WebSearchServer {
 
 impl WebSearchServer {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Config::load(std::path::Path::new("config/default.toml"))
-            .unwrap_or_else(|_| Config::default());
+        let config = Self::load_config()?;
 
         let engine = Arc::new(SearchEngine::new(config)?);
 
@@ -46,6 +46,53 @@ impl WebSearchServer {
 
         tracing::info!("WebSearchServer initialized");
         Ok(Self { engine })
+    }
+
+    /// Resolve the config path (CLI/env/default), load it with the §7 fail-fast
+    /// rule, log the resolved ABSOLUTE path (Addendum A.5), and validate the
+    /// self-contained search config (§8). Operator-facing: the startup error here
+    /// goes to stderr/logs and MAY include the path — it never reaches an MCP
+    /// client.
+    fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+        let source = resolve_config_path(
+            &std::env::args().collect::<Vec<_>>(),
+            |k| std::env::var(k).ok(),
+        );
+        let path = source.path();
+        // Log the resolved ABSOLUTE path so a CWD-hijacked default file is
+        // observable, not silent (ADR 0004 Addendum A.5).
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        tracing::info!(config_path = %abs.display(), explicit = source.is_explicit(), "resolving config");
+
+        let config = match &source {
+            // Explicit path: missing or unparseable is an operator error → fail
+            // fast, never silently fall back (ADR 0004 §7).
+            ConfigSource::Explicit(p) => {
+                if !p.exists() {
+                    return Err(format!(
+                        "config file named explicitly (--config / WEB_SEARCH_MCP_CONFIG) \
+                         not found: {}",
+                        abs.display()
+                    )
+                    .into());
+                }
+                Config::load(p).map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("failed to load explicitly-named config {}: {e}", abs.display()).into()
+                })?
+            }
+            // Default path: missing => embedded defaults (current behavior).
+            ConfigSource::Default(p) => Config::load(p).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "config/default.toml failed to load; using embedded defaults");
+                Config::default()
+            }),
+        };
+
+        // §8 startup validation — fail fast on a pinned source that can't run or
+        // an unknown provider.
+        validate_search_config(&config, |k| std::env::var(k).ok())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+        Ok(config)
     }
 
     /// Pre-warm ML models so the first real request doesn't pay cold-start cost.

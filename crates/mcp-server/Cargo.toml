@@ -7,6 +7,11 @@ edition.workspace = true
 name = "web-search-mcp"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the stealth headless (R4) path end-to-end through the orchestrator.
+browser = ["web-search-orchestrator/browser"]
+
 [dependencies]
 web-search-common = { workspace = true }
 web-search-orchestrator = { workspace = true }

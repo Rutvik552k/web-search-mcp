@@ -15,8 +15,11 @@
 | 0.1 | Produce ordered specialist chain + gates for this whole effort | `team-orchestrator` |
 | 0.2 | ⛔ Operator delivers `benchmark/urls.jsonl` (tiered, `blocked` flag) for G1/G2 coverage. `queries.jsonl` optional — G3 uses MCPBench | operator |
 | 0.3 | Build **coverage** harness (G1/G2 only) | `testing-engineer` | ✅ DONE — `crates/benchmark` (rmcp client + mock-server self-test, 19 tests green). Schema locked in `benchmark/README.md`. Also computes nDCG@10/p@5 as a secondary to MCPBench |
-| 0.5 | 🔬 Integrate **MCPBench** (https://github.com/modelscope/MCPBench) for G3: configure our MCP server (local cmd), run `evaluation_websearch.sh`, verify it drives our tools. Cite setup steps | `testing-engineer` |
+| 0.5 | 🔬 Integrate **MCPBench** (https://github.com/modelscope/MCPBench) for G3. ✅ WIRED + handshake-VERIFIED 2026-06-18 (`benchmark/mcpbench/`: config + README + `verify_handshake.py`). MCPBench plugs via SSE (`supergateway` wraps our stdio server); 15 tools discovered, `instant_search` call returned isError=False. Tools map 1:1, no adapter. Dataset fields `unique_id`/`Prompt`/`Answer`; judge = hardcoded `openai/deepseek-v3` (operator key, eval-time only). **Full 600-QA run = operator-blocked:** (a) paid OpenAI-compatible judge key serving deepseek-v3, (b) confirm/pin a `supergateway` version that re-arms per-request (current build dies after 1 SSE session), (c) run SearXNG/keyed source (keyless floor hit a CAPTCHA), (d) run MCPBench under WSL/Linux (Win path mangling). G3 `score` → `firecrawl-compare --accuracy-ours/--accuracy-firecrawl` | `testing-engineer` |
 | 0.4 | Run **baseline** on current `main`: coverage harness + MCPBench; record numbers in `benchmark/RESULTS.md` | `testing-engineer` |
+| 0.6 | 🔬 **G4 Firecrawl comparison harness** — Firecrawl adapter in `crates/benchmark` runs `/v2/scrape`+`/v2/crawl` over the **same** `urls.jsonl` + MCPBench QA pairs; records both runs in `benchmark/RESULTS.firecrawl.md`. ✅ HARNESS DONE 2026-06-18 (`9c0df30`): `firecrawl.rs`/`compare.rs`/`lib.rs`/`bin/firecrawl-compare`, 37 tests green, contract-mocked, env-key only, never a runtime dep. Verified cloud v2 contract. | `testing-engineer` |
+| 0.6a | **Self-host Firecrawl** (operator chose 2026-06-18: self-hosted AGPL Docker, not paid cloud → compute-vs-compute cost). Stand up `benchmark/firecrawl-selfhost/` compose; verify self-hosted API parity vs our v2 adapter; wire `FIRECRAWL_BASE_URL` if adapter lacks base-url env. ▶ devops-engineer running (parity verdict pending) → testing-engineer for any adapter delta | `devops-engineer` |
+| 0.6b | ⛔ Run the **real G4 baseline**: operator runs self-hosted Firecrawl + `firecrawl-compare` over `urls.jsonl`, fills `RESULTS.firecrawl.md`. Needs 0.6a parity confirmed | operator |
 
 **GATE 0:** harness reproducible; baseline coverage/accuracy numbers committed. No optimization before a baseline exists (Rule 1).
 
@@ -96,8 +99,9 @@ Each task ships with unit tests + a benchmark re-run delta. Implements ADR inter
 | 4.1 | Run accuracy eval (G3) via **MCPBench**; identify failing query classes | `data-scientist` |
 | 4.2 | Tune ranking pipeline (RRF weights, CE/ColBERT thresholds, primary-source boost) against eval — avoid overfitting to MCPBench set; hold out a split | `data-scientist` + `backend-engineer` |
 | 4.3 | Re-run full harness; confirm coverage ≥ 90% (G1) + accuracy target (G3) | `testing-engineer` |
+| 4.4 | **G4 head-to-head** — run G4 harness (0.6) ours vs Firecrawl on identical inputs; confirm **≥ +5 pts** on coverage/blocked/accuracy, **≤** Firecrawl P99 latency, **strictly lower** $/1k pages; numbers in `benchmark/RESULTS.firecrawl.md` | `testing-engineer` + `data-scientist` |
 
-**GATE 4:** G1 ≥ 0.90 and G2/G3 targets met, numbers in `benchmark/RESULTS.md`.
+**GATE 4:** G1 ≥ 0.90, G2/G3 targets met, **and G4 margins met** (numbers in `benchmark/RESULTS.md` + `benchmark/RESULTS.firecrawl.md`).
 
 ---
 

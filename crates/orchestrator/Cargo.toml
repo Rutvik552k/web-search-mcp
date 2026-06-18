@@ -3,6 +3,11 @@ name = "web-search-orchestrator"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Pass the crawler's stealth headless (R4) feature up the chain.
+browser = ["web-search-crawler/browser"]
+
 [dependencies]
 web-search-common = { workspace = true }
 web-search-crawler = { workspace = true }
@@ -15,6 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 url = { workspace = true }

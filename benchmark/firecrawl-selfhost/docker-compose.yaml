@@ -1,0 +1,166 @@
+# Self-hosted Firecrawl — G4 benchmark BASELINE infra ONLY.
+#
+# This stack is NOT part of the web_search_mcp server runtime or any shipped
+# artifact. It exists solely so the G4 head-to-head harness
+# (crates/benchmark/src/bin/firecrawl_compare.rs) can hit a LOCAL Firecrawl
+# instead of the paid cloud API. Operator-run; never deployed.
+#
+# Derived from the upstream firecrawl/docker-compose.yaml (main, verified
+# 2026-06-18) but adapted for a reproducible benchmark baseline:
+#   * Uses PREBUILT, DIGEST-PINNED GHCR images instead of `build:` from source
+#     (reproducible: same digest -> same artifact; no local source checkout).
+#   * Drops the experimental FoundationDB queue backend + its init job
+#     (NUQ_BACKEND defaults to Postgres; FDB is opt-in upstream).
+#   * Keeps the queue backend that the current main-branch `api` requires:
+#     redis + rabbitmq + nuq-postgres. These are NOT optional on main —
+#     `node dist/src/harness.js --start-docker` connects to RabbitMQ
+#     (NUQ_RABBITMQ_URL) and the Postgres-backed queue at boot.
+#
+# Image digests resolved from ghcr.io on 2026-06-18 (see README "Pinning").
+# To bump: re-resolve digests and update both the tag comment and @sha256 pin.
+
+name: firecrawl-bench
+
+x-common-env: &common-env
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+  REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
+  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000/scrape}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+  POSTGRES_DB: ${POSTGRES_DB:-postgres}
+  POSTGRES_HOST: ${POSTGRES_HOST:-nuq-postgres}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  # Self-hosted = no Supabase = no DB auth. Bearer token becomes OPTIONAL.
+  USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
+  NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-8}
+  CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS:-10}
+  MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-5}
+  BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-5}
+  BULL_AUTH_KEY: ${BULL_AUTH_KEY:-CHANGEME}
+  LOGGING_LEVEL: ${LOGGING_LEVEL:-INFO}
+  # Optional capabilities — left empty by default; see README "Feature degradation".
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  PROXY_SERVER: ${PROXY_SERVER:-}
+  PROXY_USERNAME: ${PROXY_USERNAME:-}
+  PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+  SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT:-}
+
+services:
+  api:
+    # ghcr.io/firecrawl/firecrawl:2.10.19 (resolved 2026-06-18)
+    image: ghcr.io/firecrawl/firecrawl@sha256:50446cbc0bc700a78cc588c96bd38a97f01cc4299c99b349c7bfa1ba57b6d7ed
+    environment:
+      <<: *common-env
+      HOST: "0.0.0.0"
+      PORT: ${INTERNAL_PORT:-3002}
+      EXTRACT_WORKER_PORT: ${EXTRACT_WORKER_PORT:-3004}
+      WORKER_PORT: ${WORKER_PORT:-3005}
+      NUQ_RABBITMQ_URL: ${NUQ_RABBITMQ_URL:-amqp://rabbitmq:5672}
+      HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}
+      ENV: local
+    command: node dist/src/harness.js --start-docker
+    depends_on:
+      redis:
+        condition: service_started
+      playwright-service:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_started
+    ports:
+      # Host 3002 -> container 3002. This is the LOCAL API base: http://localhost:3002
+      - "${PORT:-3002}:${INTERNAL_PORT:-3002}"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    networks:
+      - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cpus: 4.0
+    mem_limit: 8G
+    memswap_limit: 8G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  playwright-service:
+    # ghcr.io/firecrawl/playwright-service:latest (resolved 2026-06-18; no semver tag published upstream)
+    image: ghcr.io/firecrawl/playwright-service@sha256:1f6eba6403207d501a63d9b1d4685b6316b4fc7968fe64a5839ab1bfec9d1c14
+    environment:
+      PORT: 3000
+      PROXY_SERVER: ${PROXY_SERVER:-}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      BLOCK_MEDIA: ${BLOCK_MEDIA:-}
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
+    networks:
+      - backend
+    cpus: 2.0
+    mem_limit: 4G
+    memswap_limit: 4G
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --bind 0.0.0.0
+    networks:
+      - backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+        compress: "true"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    command: rabbitmq-server
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+        compress: "true"
+
+  nuq-postgres:
+    # ghcr.io/firecrawl/nuq-postgres:latest (resolved 2026-06-18; no semver tag published upstream)
+    # Postgres-backed queue backend (default; NUQ_BACKEND unset -> Postgres).
+    image: ghcr.io/firecrawl/nuq-postgres@sha256:f9388bd25ae2e1f1d034518236f993ce236173c1d8800ce24092ea6643a95a33
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    # No host port mapping: queue DB stays internal to the compose network.
+    networks:
+      - backend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+networks:
+  backend:
+    driver: bridge

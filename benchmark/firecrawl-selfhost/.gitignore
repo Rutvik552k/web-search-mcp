@@ -1,0 +1,2 @@
+# Never commit a real env for the self-host baseline.
+.env

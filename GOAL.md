@@ -80,13 +80,23 @@ Targets are claimed only after the harness reports them.
   1. Coverage (G1 metric),
   2. Blocked-subset success (G2 metric),
   3. MCPBench accuracy (G3 metric),
-  4. Latency / cost — P99 latency per page **and** $ per 1k pages (ours is API-free → cost ≈ compute only).
+  4. Latency / cost — P99 latency per page **and** compute $ per 1k pages. Firecrawl runs
+     **self-hosted** (AGPL-3.0, Docker) on the same hardware, so both sides are compute-only;
+     cost compares like-for-like (no paid cloud tier).
 - **Target:** **≥ +5 percentage points** over Firecrawl on each of coverage, blocked-subset,
-  and accuracy; **≤ Firecrawl** on P99 latency and **strictly lower** $/1k pages.
+  and accuracy; **≤ Firecrawl** on P99 latency and **≤ Firecrawl** on compute $/1k pages.
 - **Artifact:** head-to-head comparison report (`benchmark/RESULTS.firecrawl.md`) produced by the
   benchmark harness, with both runs on identical inputs, same hardware, same date.
-- **Note:** Firecrawl needs an API key to run; that key is for the **baseline comparison only**
-  and is never a runtime dependency of our server (per Mission: API-free).
+- **Note:** Firecrawl runs **self-hosted locally** for the comparison (operator decision
+  2026-06-18) — not the paid cloud API. It is **baseline-comparison only**, a separate
+  process queried over HTTP, never a runtime dependency of our server (Mission stays API-free).
+  AGPL-3.0: unmodified, not redistributed, not exposed to third parties → no source-disclosure
+  obligation on our code, no contamination.
+- **⚠️ Blocked-tier caveat:** self-hosted Firecrawl has **no Fire-engine**, so it is weaker on
+  bot-protected pages than the paid cloud. The G2 (blocked-subset) number from this baseline is a
+  **floor** for Firecrawl, not its cloud ceiling — `RESULTS.firecrawl.md` must state this, and a
+  G2 win over self-host is **not** a win over cloud Firecrawl. Cloud-equivalent blocked-tier
+  comparison would need the paid cloud key (operator decision — see TASKS 0.6b).
 
 ## 4. Non-goals (current)
 
@@ -101,7 +111,8 @@ Targets are claimed only after the harness reports them.
 - `queries.jsonl` no longer required: G3 uses MCPBench's 600 built-in QA pairs
   (optionally extend with custom QA in MCPBench format).
 - Set G2 / G3 numeric targets after baseline run.
-- Provide a Firecrawl API key for the G4 baseline comparison run (baseline-only, not a runtime dep).
+- Run the self-hosted Firecrawl Docker stack for the G4 baseline comparison (baseline-only,
+  not a runtime dep; setup in `benchmark/firecrawl-selfhost/`).
 - Provide proxy-pool credentials and CAPTCHA-solver API key (or approve a provider).
 
 ---

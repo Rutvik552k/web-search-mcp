@@ -10,7 +10,9 @@
 ## 1. Mission statement
 
 A self-contained, API-free web-search MCP server that can **scrape any website —
-with or without anti-bot blockers — at high accuracy and 90%+ resource coverage.**
+with or without anti-bot blockers — at high accuracy and 90%+ resource coverage**,
+and that **beats Firecrawl head-to-head** (see G4) while requiring no third-party
+scrape API.
 
 ## 2. Scope & authorization (read first)
 
@@ -42,7 +44,7 @@ These are **hard defaults**, not optional, because they neutralize the real risk
 
 ## 3. Measurable acceptance criteria (the "ground truth")
 
-The goal is **not testable until these three artifacts exist** and are committed.
+The goal is **not testable until these artifacts exist** and are committed.
 Targets are claimed only after the harness reports them.
 
 ### G1 — Coverage ≥ 90%
@@ -70,6 +72,22 @@ Targets are claimed only after the harness reports them.
 - **Note:** MCPBench does NOT measure coverage or blocker bypass — those are G1/G2,
   measured by our own harness. MCPBench only covers G3.
 
+### G4 — Beat Firecrawl head-to-head
+- **Baseline:** [Firecrawl](https://github.com/firecrawl/firecrawl) (`/scrape` + `/crawl`),
+  a leading commercial+OSS crawl/scrape API. Run it over the **same** `benchmark/urls.jsonl`
+  and the **same** MCPBench QA pairs as G1–G3, recording its results as the comparison line.
+- **Metric:** our score minus Firecrawl's score on each of:
+  1. Coverage (G1 metric),
+  2. Blocked-subset success (G2 metric),
+  3. MCPBench accuracy (G3 metric),
+  4. Latency / cost — P99 latency per page **and** $ per 1k pages (ours is API-free → cost ≈ compute only).
+- **Target:** **≥ +5 percentage points** over Firecrawl on each of coverage, blocked-subset,
+  and accuracy; **≤ Firecrawl** on P99 latency and **strictly lower** $/1k pages.
+- **Artifact:** head-to-head comparison report (`benchmark/RESULTS.firecrawl.md`) produced by the
+  benchmark harness, with both runs on identical inputs, same hardware, same date.
+- **Note:** Firecrawl needs an API key to run; that key is for the **baseline comparison only**
+  and is never a runtime dependency of our server (per Mission: API-free).
+
 ## 4. Non-goals (current)
 
 - Distributed/multi-node crawling at internet scale.
@@ -83,7 +101,9 @@ Targets are claimed only after the harness reports them.
 - `queries.jsonl` no longer required: G3 uses MCPBench's 600 built-in QA pairs
   (optionally extend with custom QA in MCPBench format).
 - Set G2 / G3 numeric targets after baseline run.
+- Provide a Firecrawl API key for the G4 baseline comparison run (baseline-only, not a runtime dep).
 - Provide proxy-pool credentials and CAPTCHA-solver API key (or approve a provider).
 
 ---
-_Last updated: 2026-06-06. Change this file only with operator sign-off — it is the contract._
+_Last updated: 2026-06-18 (added G4: beat Firecrawl head-to-head, operator sign-off).
+Change this file only with operator sign-off — it is the contract._

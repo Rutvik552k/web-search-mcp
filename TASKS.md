@@ -17,6 +17,7 @@
 | 0.3 | Build **coverage** harness (G1/G2 only) | `testing-engineer` | ✅ DONE — `crates/benchmark` (rmcp client + mock-server self-test, 19 tests green). Schema locked in `benchmark/README.md`. Also computes nDCG@10/p@5 as a secondary to MCPBench |
 | 0.5 | 🔬 Integrate **MCPBench** (https://github.com/modelscope/MCPBench) for G3: configure our MCP server (local cmd), run `evaluation_websearch.sh`, verify it drives our tools. Cite setup steps | `testing-engineer` |
 | 0.4 | Run **baseline** on current `main`: coverage harness + MCPBench; record numbers in `benchmark/RESULTS.md` | `testing-engineer` |
+| 0.6 | 🔬 **G4 Firecrawl comparison harness** — add a Firecrawl adapter to `crates/benchmark` that runs Firecrawl `/scrape`+`/crawl` over the **same** `urls.jsonl` + MCPBench QA pairs; record both runs (identical inputs/hardware/date) in `benchmark/RESULTS.firecrawl.md`. Verify Firecrawl API contract + auth before code (Rule 1). Key from env only, baseline-only, never a runtime dep. Deps: 0.2 (urls), 0.3 (harness ✅), operator Firecrawl key | `testing-engineer` |
 
 **GATE 0:** harness reproducible; baseline coverage/accuracy numbers committed. No optimization before a baseline exists (Rule 1).
 
@@ -96,8 +97,9 @@ Each task ships with unit tests + a benchmark re-run delta. Implements ADR inter
 | 4.1 | Run accuracy eval (G3) via **MCPBench**; identify failing query classes | `data-scientist` |
 | 4.2 | Tune ranking pipeline (RRF weights, CE/ColBERT thresholds, primary-source boost) against eval — avoid overfitting to MCPBench set; hold out a split | `data-scientist` + `backend-engineer` |
 | 4.3 | Re-run full harness; confirm coverage ≥ 90% (G1) + accuracy target (G3) | `testing-engineer` |
+| 4.4 | **G4 head-to-head** — run G4 harness (0.6) ours vs Firecrawl on identical inputs; confirm **≥ +5 pts** on coverage/blocked/accuracy, **≤** Firecrawl P99 latency, **strictly lower** $/1k pages; numbers in `benchmark/RESULTS.firecrawl.md` | `testing-engineer` + `data-scientist` |
 
-**GATE 4:** G1 ≥ 0.90 and G2/G3 targets met, numbers in `benchmark/RESULTS.md`.
+**GATE 4:** G1 ≥ 0.90, G2/G3 targets met, **and G4 margins met** (numbers in `benchmark/RESULTS.md` + `benchmark/RESULTS.firecrawl.md`).
 
 ---
 

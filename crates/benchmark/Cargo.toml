@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Library: pure scoring + report modules (metrics, firecrawl adapter, G4
+# compare) shared by the binaries so the math is unit-tested once.
+[lib]
+name = "web_search_benchmark"
+path = "src/lib.rs"
+
 # Main harness: connects to an MCP server, runs the G1/G2/G3 benchmark.
 [[bin]]
 name = "benchmark"
 path = "src/main.rs"
+
+# G4 head-to-head runner: ours vs Firecrawl on the same urls.jsonl. Firecrawl
+# is baseline-comparison only (env key, never a runtime dep) — see GOAL.md §G4.
+[[bin]]
+name = "firecrawl-compare"
+path = "src/bin/firecrawl_compare.rs"
 
 # Hermetic mock MCP server — used ONLY for the harness self-test (no network,
 # no ML models). Lets `cargo test` / the smoke run exercise the full JSON-RPC
@@ -33,3 +45,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Firecrawl baseline adapter (G4) — HTTP client for the operator-invoked real
+# run only. Never used by the server runtime. Same reqwest the workspace pins.
+reqwest = { workspace = true }

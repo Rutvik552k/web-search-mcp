@@ -19,7 +19,7 @@
 //! Self-test (hermetic, no network/models) uses the mock server — see
 //! benchmark/README.md.
 
-mod metrics;
+use web_search_benchmark::metrics;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -293,6 +293,16 @@ async fn run_query(
     match call_tool_text(client, tool, map, timeout).await {
         Ok(text) => {
             let ranked = parse_result_urls(&text);
+            // BENCH_DUMP=1 → print the ranked result URLs (and a hit marker vs the
+            // labels) to stderr, so a real query's output can be eyeballed.
+            if std::env::var("BENCH_DUMP").is_ok() {
+                let rels = metrics::relevance_vector(&ranked, &spec.relevant_urls);
+                eprintln!("[dump] query: {}", spec.query);
+                for (i, u) in ranked.iter().enumerate() {
+                    let hit = rels.get(i).copied().unwrap_or(0) > 0;
+                    eprintln!("[dump]  {:>2}. {} {}", i + 1, if hit { "✓" } else { " " }, u);
+                }
+            }
             let rels = metrics::relevance_vector(&ranked, &spec.relevant_urls);
             QueryOutcome {
                 query: spec.query.clone(),

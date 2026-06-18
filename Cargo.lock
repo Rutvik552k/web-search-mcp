@@ -4814,6 +4814,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
